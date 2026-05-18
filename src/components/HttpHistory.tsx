@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Search, Filter, RefreshCw, Clock, ArrowRight, ArrowDown, ArrowUp, Code2, FileJson, Trash2 } from 'lucide-react';
+import { Search, Filter, RefreshCw, Clock, ArrowRight, ArrowDown, ArrowUp, Code2, FileJson, Trash2, Play, Replace } from 'lucide-react';
 
 interface HistoryItem {
   id: string;
@@ -23,6 +23,8 @@ export default function HttpHistory() {
   const [methodFilter, setMethodFilter] = useState('ALL');
   const [statusFilter, setStatusFilter] = useState('ALL');
   const [activeTab, setActiveTab] = useState<'request' | 'response'>('request');
+  const [replaying, setReplaying] = useState(false);
+  const [replayResult, setReplayResult] = useState<{ status: number; duration: number; appliedRules: number } | null>(null);
 
   const fetchHistory = async () => {
     setLoading(true);
@@ -243,9 +245,34 @@ export default function HttpHistory() {
           ) : (
             <>
               <div className="p-4 bg-black/50 border-b border-emerald-900/30 shadow-[0_2px_10px_rgba(0,0,0,0.2)]">
-                <div className="flex items-center gap-3 mb-2">
-                  <span className={`text-sm font-bold font-mono ${getMethodColor(selectedItem.method)}`}>{selectedItem.method}</span>
-                  <span className="text-sm font-mono text-emerald-100 break-all">{selectedItem.url}</span>
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-3">
+                    <span className={`text-sm font-bold font-mono ${getMethodColor(selectedItem.method)}`}>{selectedItem.method}</span>
+                    <span className="text-sm font-mono text-emerald-100 break-all">{selectedItem.url}</span>
+                  </div>
+                  <button
+                    onClick={async () => {
+                      setReplaying(true);
+                      setReplayResult(null);
+                      try {
+                        const res = await fetch(`/api/history/${selectedItem.id}/replay`, { method: 'POST' });
+                        const data = await res.json();
+                        if (!res.ok) throw new Error(data.error || 'Replay failed');
+                        setReplayResult({ status: data.status, duration: data.duration, appliedRules: data.appliedRules });
+                        fetchHistory();
+                      } catch (err: any) {
+                        setReplayResult(null);
+                      } finally {
+                        setReplaying(false);
+                      }
+                    }}
+                    disabled={replaying}
+                    className="flex items-center gap-1.5 text-xs px-3 py-1.5 bg-cyan-900/30 hover:bg-cyan-900/50 border border-cyan-800/50 rounded text-cyan-300 hover:text-cyan-200 transition-all"
+                    title="Replay this request through the proxy (match-replace rules applied)"
+                  >
+                    {replaying ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+                    Replay
+                  </button>
                 </div>
                 <div className="flex items-center gap-4 text-xs font-mono">
                   <span className={`flex items-center gap-1 ${getStatusColor(selectedItem.status)}`}>
@@ -256,6 +283,12 @@ export default function HttpHistory() {
                     <Clock className="w-3 h-3" />
                     {new Date(selectedItem.created_at).toLocaleString()}
                   </span>
+                  {replayResult && (
+                    <span className="flex items-center gap-1 text-cyan-400">
+                      <Replace className="w-3 h-3" />
+                      Replayed: {replayResult.status} in {replayResult.duration}ms ({replayResult.appliedRules} rules)
+                    </span>
+                  )}
                 </div>
               </div>
 

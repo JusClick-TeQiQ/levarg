@@ -191,6 +191,24 @@ db.exec(`
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(scope_id) REFERENCES scopes(id) ON DELETE CASCADE
   );
+
+  -- Match & Replace rules applied to proxy requests.  Each rule specifies a
+  -- target (url, header, body), a match pattern (literal or regex), and a
+  -- replacement string.  Rules fire in priority order on every /api/lab/proxy
+  -- call and /api/browser capture pipeline.  Enabled flag allows toggling
+  -- without deleting.
+  CREATE TABLE IF NOT EXISTS match_replace_rules (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    target TEXT NOT NULL,       -- 'url' | 'header' | 'body' | 'method'
+    match_type TEXT NOT NULL DEFAULT 'literal', -- 'literal' | 'regex'
+    match_pattern TEXT NOT NULL,
+    replace_value TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
 `);
 
 // Migration: Add 'phase' column to 'automation_jobs' if it doesn't exist

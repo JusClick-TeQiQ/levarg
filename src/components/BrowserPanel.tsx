@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import {
   Globe, Play, Square, Save, Pause, AlertCircle, Activity, Eye, EyeOff,
+  Navigation, ExternalLink,
 } from 'lucide-react';
 
 interface Scope {
@@ -34,12 +35,13 @@ export default function BrowserPanel() {
   const [scopes, setScopes] = useState<Scope[]>([]);
   const [status, setStatus] = useState<BrowserStatus>(EMPTY_STATUS);
   const [selectedScopeId, setSelectedScopeId] = useState<string>('');
-  const [headless, setHeadless] = useState(false);
+  const [headless, setHeadless] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [sessionName, setSessionName] = useState('');
   const [sessionNotes, setSessionNotes] = useState('');
   const [savedMessage, setSavedMessage] = useState('');
+  const [navUrl, setNavUrl] = useState('');
 
   const fetchAll = async () => {
     try {
@@ -54,7 +56,7 @@ export default function BrowserPanel() {
       if (!selectedScopeId && scopesData.length > 0) {
         setSelectedScopeId(scopesData[0].id);
       }
-    } catch (err) {
+    } catch {
       // network errors are expected during navigation; ignore
     }
   };
@@ -65,6 +67,15 @@ export default function BrowserPanel() {
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Pre-fill nav URL from scope when scope changes
+  useEffect(() => {
+    const scope = scopes.find((s) => s.id === selectedScopeId);
+    if (scope && !navUrl) {
+      setNavUrl(`https://${scope.domain}`);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedScopeId, scopes]);
 
   const launch = async () => {
     if (!selectedScopeId) {
@@ -99,6 +110,29 @@ export default function BrowserPanel() {
         throw new Error(data.error || 'Close failed');
       }
       await fetchAll();
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const navigate = async () => {
+    if (!navUrl.trim()) {
+      setError('Enter a URL to navigate to.');
+      return;
+    }
+    setBusy(true);
+    setError('');
+    try {
+      const res = await fetch('/api/browser/navigate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: navUrl.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Navigate failed');
+      setStatus(data);
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -235,6 +269,38 @@ export default function BrowserPanel() {
         </div>
       </div>
 
+      {/* Navigate panel — only visible when browser is running */}
+      {status.running && (
+        <div className="cyber-card p-6 mb-6 relative">
+          <div className="absolute top-0 left-0 w-full h-[1px] bg-gradient-to-r from-transparent via-emerald-500/30 to-transparent" />
+          <h3 className="text-[10px] font-mono uppercase tracking-[0.2em] font-bold text-emerald-500/70 mb-4">
+            Navigate
+          </h3>
+          <div className="flex gap-3">
+            <input
+              type="text"
+              value={navUrl}
+              onChange={(e) => setNavUrl(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') navigate(); }}
+              placeholder={`https://${status.scopeDomain ?? 'example.com'}/login`}
+              className="cyber-input flex-1"
+            />
+            <button
+              type="button"
+              onClick={navigate}
+              disabled={busy}
+              className="cyber-button"
+            >
+              <Navigation className="w-4 h-4" />
+              Go
+            </button>
+          </div>
+          <p className="text-[10px] text-emerald-500/50 font-mono mt-2">
+            Navigate the browser to a URL. Requests to in-scope hosts are captured automatically.
+          </p>
+        </div>
+      )}
+
       {/* Status panel */}
       <div className="cyber-card p-6 mb-6 relative">
         <div className="absolute top-0 left-0 w-full h-[1px] bg-gradient-to-r from-transparent via-emerald-500/30 to-transparent" />
@@ -267,13 +333,30 @@ export default function BrowserPanel() {
             <div className="text-[10px] font-mono uppercase tracking-widest text-emerald-500/70 mb-2">Open Pages</div>
             <div className="space-y-1 max-h-48 overflow-y-auto scrollbar-hide">
               {status.pages.map((p, i) => (
-                <div key={i} className="text-xs font-mono text-emerald-200/80 truncate border-l-2 border-emerald-500/30 pl-2">
+                <div key={i} className="text-xs font-mono text-emerald-200/80 truncate border-l-2 border-emerald-500/30 pl-2 flex items-center gap-2">
+                  <ExternalLink className="w-3 h-3 flex-shrink-0 text-emerald-500/50" />
                   {p.title || '(untitled)'} <span className="text-emerald-500/50">— {p.url}</span>
                 </div>
               ))}
             </div>
           </div>
         )}
+      </div>
+
+      {/* Workflow guide */}
+      <div className="cyber-card p-6 mb-6 relative">
+        <div className="absolute top-0 left-0 w-full h-[1px] bg-gradient-to-r from-transparent via-amber-500/30 to-transparent" />
+        <h3 className="text-[10px] font-mono uppercase tracking-[0.2em] font-bold text-amber-500/70 mb-3">
+          Auth Capture Workflow
+        </h3>
+        <ol className="list-decimal list-inside space-y-1.5 text-xs font-mono text-emerald-200/70">
+          <li>Add your target domain in <span className="text-emerald-400">Scope Control</span></li>
+          <li>Select the scope above and click <span className="text-emerald-400">Launch</span> (headless mode captures without a GUI window)</li>
+          <li>Use the <span className="text-emerald-400">Navigate</span> bar to browse to the login page</li>
+          <li>For SSO/OAuth, use the <span className="text-amber-400">OS Browser Bridge</span> to capture cookies from your real browser instead</li>
+          <li>Once authenticated, click <span className="text-emerald-400">Save</span> below to snapshot cookies as a reusable Session</li>
+          <li>Use the session in <span className="text-emerald-400">Request Lab</span>, <span className="text-emerald-400">Fuzzing Scanner</span>, or <span className="text-emerald-400">Auto-Hunter</span></li>
+        </ol>
       </div>
 
       {/* Save as Session */}

@@ -240,12 +240,34 @@ async function startServer() {
       // Layer per-endpoint custom headers (won't overwrite explicit headers)
       finalHeaders = EndpointHeaders.mergeHeaders(url, finalHeaders);
 
+      // Apply enabled match-replace rules in priority order
+      let effectiveMethod = method;
+      let effectiveUrl = url;
+      let effectiveBody = body;
+      const mrRules = db.prepare("SELECT * FROM match_replace_rules WHERE enabled = 1 ORDER BY priority ASC").all() as {
+        target: string; match_type: string; match_pattern: string; replace_value: string;
+      }[];
+      for (const rule of mrRules) {
+        const re = rule.match_type === 'regex' ? new RegExp(rule.match_pattern, 'g') : null;
+        const doReplace = (s: string) => re ? s.replace(re, rule.replace_value) : s.split(rule.match_pattern).join(rule.replace_value);
+        switch (rule.target) {
+          case 'url': effectiveUrl = doReplace(effectiveUrl); break;
+          case 'method': effectiveMethod = doReplace(effectiveMethod); break;
+          case 'header': {
+            const hs = JSON.stringify(finalHeaders);
+            finalHeaders = JSON.parse(doReplace(hs));
+            break;
+          }
+          case 'body': if (typeof effectiveBody === 'string') effectiveBody = doReplace(effectiveBody); break;
+        }
+      }
+
       const startTime = Date.now();
       const response = await axios({
-        method,
-        url,
+        method: effectiveMethod,
+        url: effectiveUrl,
         headers: finalHeaders,
-        data: body,
+        data: effectiveBody,
         validateStatus: () => true,
         timeout: 10000
       });
@@ -256,7 +278,7 @@ async function startServer() {
 
       // Save request/response for history/diff
       db.prepare('INSERT INTO requests (id, method, url, headers, body) VALUES (?, ?, ?, ?, ?)')
-        .run(requestId, method, url, JSON.stringify(finalHeaders), typeof body === 'string' ? body : JSON.stringify(body));
+        .run(requestId, effectiveMethod, effectiveUrl, JSON.stringify(finalHeaders), typeof effectiveBody === 'string' ? effectiveBody : JSON.stringify(effectiveBody));
       
       db.prepare('INSERT INTO responses (id, request_id, status, headers, body) VALUES (?, ?, ?, ?, ?)')
         .run(responseId, requestId, response.status, JSON.stringify(response.headers), typeof response.data === 'string' ? response.data : JSON.stringify(response.data));
@@ -266,7 +288,8 @@ async function startServer() {
         status: response.status,
         headers: response.headers,
         body: response.data,
-        duration
+        duration,
+        matchReplaceApplied: mrRules.length,
       });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -970,6 +993,170 @@ async function startServer() {
     }
   });
 
+  app.post('/api/browser/navigate', async (req, res) => {
+    try {
+      const { url: navUrl } = req.body as { url: string };
+      if (!navUrl) return res.status(400).json({ error: 'url is required' });
+      const browser = BrowserManager.getBrowserOrThrow();
+      const pages = await browser.pages();
+      const page = pages[pages.length - 1] ?? await BrowserManager.newPage();
+      await page.goto(navUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      res.json(await BrowserManager.status());
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  // --- Match & Replace rules ---
+  // Rules that modify outgoing proxy requests in-flight.  Applied in priority
+  // order before every /api/lab/proxy dispatch.
+
+  app.get('/api/match-replace', (_req, res) => {
+    const rules = db.prepare('SELECT * FROM match_replace_rules ORDER BY priority ASC, created_at ASC').all();
+    res.json(rules);
+  });
+
+  app.post('/api/match-replace', (req, res) => {
+    try {
+      const { name, target, matchType, matchPattern, replaceValue, priority, enabled } = req.body as {
+        name: string;
+        target: string;
+        matchType?: string;
+        matchPattern: string;
+        replaceValue: string;
+        priority?: number;
+        enabled?: boolean;
+      };
+      if (!name || !target || !matchPattern) {
+        return res.status(400).json({ error: 'name, target, and matchPattern are required' });
+      }
+      const id = uuidv4();
+      db.prepare(
+        'INSERT INTO match_replace_rules (id, name, target, match_type, match_pattern, replace_value, priority, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      ).run(id, name, target, matchType ?? 'literal', matchPattern, replaceValue ?? '', priority ?? 0, enabled === false ? 0 : 1);
+      const created = db.prepare('SELECT * FROM match_replace_rules WHERE id = ?').get(id);
+      res.json(created);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.patch('/api/match-replace/:id', (req, res) => {
+    try {
+      const existing = db.prepare('SELECT id FROM match_replace_rules WHERE id = ?').get(req.params.id);
+      if (!existing) return res.status(404).json({ error: 'Rule not found' });
+      const { name, target, matchType, matchPattern, replaceValue, priority, enabled } = req.body as {
+        name?: string; target?: string; matchType?: string; matchPattern?: string;
+        replaceValue?: string; priority?: number; enabled?: boolean;
+      };
+      const sets: string[] = [];
+      const vals: unknown[] = [];
+      if (name !== undefined) { sets.push('name = ?'); vals.push(name); }
+      if (target !== undefined) { sets.push('target = ?'); vals.push(target); }
+      if (matchType !== undefined) { sets.push('match_type = ?'); vals.push(matchType); }
+      if (matchPattern !== undefined) { sets.push('match_pattern = ?'); vals.push(matchPattern); }
+      if (replaceValue !== undefined) { sets.push('replace_value = ?'); vals.push(replaceValue); }
+      if (priority !== undefined) { sets.push('priority = ?'); vals.push(priority); }
+      if (enabled !== undefined) { sets.push('enabled = ?'); vals.push(enabled ? 1 : 0); }
+      if (sets.length > 0) {
+        sets.push("updated_at = datetime('now')");
+        vals.push(req.params.id);
+        db.prepare(`UPDATE match_replace_rules SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+      }
+      res.json(db.prepare('SELECT * FROM match_replace_rules WHERE id = ?').get(req.params.id));
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/match-replace/:id/toggle', (req, res) => {
+    const row = db.prepare('SELECT enabled FROM match_replace_rules WHERE id = ?').get(req.params.id) as { enabled: number } | undefined;
+    if (!row) return res.status(404).json({ error: 'Rule not found' });
+    const next = row.enabled ? 0 : 1;
+    db.prepare("UPDATE match_replace_rules SET enabled = ?, updated_at = datetime('now') WHERE id = ?").run(next, req.params.id);
+    res.json(db.prepare('SELECT * FROM match_replace_rules WHERE id = ?').get(req.params.id));
+  });
+
+  app.delete('/api/match-replace/:id', (req, res) => {
+    const result = db.prepare('DELETE FROM match_replace_rules WHERE id = ?').run(req.params.id);
+    if (result.changes === 0) return res.status(404).json({ error: 'Rule not found' });
+    res.json({ success: true });
+  });
+
+  app.delete('/api/match-replace', (_req, res) => {
+    const result = db.prepare('DELETE FROM match_replace_rules').run();
+    res.json({ success: true, deleted: result.changes });
+  });
+
+  // Replay: re-send a request from history through the proxy, applying active
+  // match-replace rules. Returns the fresh response.
+  app.post('/api/history/:requestId/replay', async (req, res) => {
+    try {
+      const original = db.prepare('SELECT method, url, headers, body FROM requests WHERE id = ?').get(req.params.requestId) as
+        { method: string; url: string; headers: string | null; body: string | null } | undefined;
+      if (!original) return res.status(404).json({ error: 'Request not found' });
+
+      let rMethod = original.method;
+      let rUrl = original.url;
+      let rHeaders: Record<string, string> = {};
+      try { rHeaders = original.headers ? JSON.parse(original.headers) : {}; } catch { /* keep empty */ }
+      let rBody: string | null = original.body;
+
+      // Apply enabled match-replace rules
+      const rules = db.prepare("SELECT * FROM match_replace_rules WHERE enabled = 1 ORDER BY priority ASC").all() as {
+        target: string; match_type: string; match_pattern: string; replace_value: string;
+      }[];
+      for (const rule of rules) {
+        const re = rule.match_type === 'regex' ? new RegExp(rule.match_pattern, 'g') : null;
+        const doReplace = (s: string) => re ? s.replace(re, rule.replace_value) : s.split(rule.match_pattern).join(rule.replace_value);
+        switch (rule.target) {
+          case 'url': rUrl = doReplace(rUrl); break;
+          case 'method': rMethod = doReplace(rMethod); break;
+          case 'header': {
+            const headersStr = JSON.stringify(rHeaders);
+            rHeaders = JSON.parse(doReplace(headersStr));
+            break;
+          }
+          case 'body': if (rBody) rBody = doReplace(rBody); break;
+        }
+      }
+
+      // Layer per-endpoint custom headers
+      rHeaders = EndpointHeaders.mergeHeaders(rUrl, rHeaders);
+
+      const startTime = Date.now();
+      const response = await axios({
+        method: rMethod as any,
+        url: rUrl,
+        headers: rHeaders,
+        data: rBody ?? undefined,
+        validateStatus: () => true,
+        timeout: 10000,
+      });
+      const duration = Date.now() - startTime;
+
+      const requestId = uuidv4();
+      const responseId = uuidv4();
+      db.prepare('INSERT INTO requests (id, method, url, headers, body) VALUES (?, ?, ?, ?, ?)')
+        .run(requestId, rMethod, rUrl, JSON.stringify(rHeaders), rBody);
+      db.prepare('INSERT INTO responses (id, request_id, status, headers, body) VALUES (?, ?, ?, ?, ?)')
+        .run(responseId, requestId, response.status, JSON.stringify(response.headers),
+          typeof response.data === 'string' ? response.data : JSON.stringify(response.data));
+
+      res.json({
+        id: responseId,
+        requestId,
+        status: response.status,
+        headers: response.headers,
+        body: response.data,
+        duration,
+        appliedRules: rules.length,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // Fuzzing Engine
   app.post('/api/scans', async (req, res) => {
     const { targetUrl, payloadSetId, method, headers, body, sessionId } = req.body as {
@@ -1183,10 +1370,11 @@ async function startServer() {
       const findings = (db.prepare('SELECT COUNT(*) as c FROM stack_gap_findings').get() as any).c;
       const authFlows = (db.prepare('SELECT COUNT(*) as c FROM auth_flows').get() as any).c;
       const requests = (db.prepare('SELECT COUNT(*) as c FROM requests').get() as any).c;
+      const matchReplaceRules = (db.prepare('SELECT COUNT(*) as c FROM match_replace_rules').get() as any).c;
       res.json({
         scopes, endpoints, payloads, flows, sessions, credentials,
         scans, runningScans, automationJobs, runningJobs, findings,
-        authFlows, requests,
+        authFlows, requests, matchReplaceRules,
       });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
