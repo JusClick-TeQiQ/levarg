@@ -4,7 +4,7 @@ import {
   Activity, LayoutDashboard, Binary, Layers, History, Target,
   Globe, KeyRound, Lock, LogIn, Smartphone, ChevronDown, ChevronRight,
   Compass, Crosshair, Beaker, Wrench, Archive, UserCheck,
-  Menu, X, Info,
+  Menu, X, Info, Replace, ShieldAlert,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
@@ -33,6 +33,8 @@ import About from './components/About';
 import WafPanel from './components/WafPanel';
 import OriginIpPanel from './components/OriginIpPanel';
 import EndpointHeadersPanel from './components/EndpointHeadersPanel';
+import MatchReplacePanel from './components/MatchReplacePanel';
+import StridePanel from './components/StridePanel';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -43,7 +45,8 @@ type View =
   | 'scope' | 'recon'
   | 'identity' | 'browser' | 'sessions' | 'credentials' | 'authflows' | 'osbridge'
   | 'automation' | 'lab' | 'scanner' | 'stackgap' | 'flows' | 'waf' | 'originip'
-  | 'encoder' | 'payloads' | 'endpointheaders'
+  | 'encoder' | 'payloads' | 'endpointheaders' | 'matchreplace'
+  | 'stride'
   | 'history'
   | 'about';
 
@@ -94,6 +97,7 @@ const NAV_SECTIONS: NavSection[] = [
       { id: 'stackgap', label: 'Stack Gap', icon: Layers },
       { id: 'waf', label: 'WAF Analysis', icon: Shield },
       { id: 'originip', label: 'Origin IP', icon: Globe },
+      { id: 'stride', label: 'STRIDE Model', icon: ShieldAlert },
       { id: 'flows', label: 'State Engine', icon: GitBranch },
     ],
   },
@@ -105,6 +109,7 @@ const NAV_SECTIONS: NavSection[] = [
       { id: 'encoder', label: 'Data Encoder', icon: Binary },
       { id: 'payloads', label: 'Payloads', icon: Database },
       { id: 'endpointheaders', label: 'Endpoint Headers', icon: Terminal },
+      { id: 'matchreplace', label: 'Match & Replace', icon: Replace },
     ],
   },
   {
@@ -413,6 +418,9 @@ export default function App() {
               {activeView === 'encoder' && <Encoder initialText={encoderTarget} />}
               {activeView === 'payloads' && <PayloadManager />}
               {activeView === 'endpointheaders' && <EndpointHeadersPanel />}
+              {activeView === 'matchreplace' && <MatchReplacePanel />}
+
+              {activeView === 'stride' && <StridePanel />}
 
               {activeView === 'history' && <HttpHistory />}
 

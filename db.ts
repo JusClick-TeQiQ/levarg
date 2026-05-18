@@ -191,6 +191,47 @@ db.exec(`
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(scope_id) REFERENCES scopes(id) ON DELETE CASCADE
   );
+
+  -- Match & Replace rules applied to proxy requests.  Each rule specifies a
+  -- target (url, header, body), a match pattern (literal or regex), and a
+  -- replacement string.  Rules fire in priority order on every /api/lab/proxy
+  -- call and /api/browser capture pipeline.  Enabled flag allows toggling
+  -- without deleting.
+  CREATE TABLE IF NOT EXISTS match_replace_rules (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    target TEXT NOT NULL,       -- 'url' | 'header' | 'body' | 'method'
+    match_type TEXT NOT NULL DEFAULT 'literal', -- 'literal' | 'regex'
+    match_pattern TEXT NOT NULL,
+    replace_value TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  -- STRIDE threat model entries. Each threat maps to one of the six STRIDE
+  -- categories and is optionally bound to a scope. Threats track severity,
+  -- status (identified → mitigated → accepted → resolved), affected assets,
+  -- attack vectors, and mitigation notes. The auto-analyze endpoint can
+  -- generate initial threat hypotheses from recon data.
+  CREATE TABLE IF NOT EXISTS stride_threats (
+    id TEXT PRIMARY KEY,
+    scope_id TEXT,
+    category TEXT NOT NULL,          -- 'spoofing' | 'tampering' | 'repudiation' | 'info_disclosure' | 'dos' | 'elevation'
+    title TEXT NOT NULL,
+    description TEXT,
+    affected_asset TEXT,             -- URL, endpoint, or component name
+    attack_vector TEXT,              -- how the threat can be exploited
+    severity TEXT NOT NULL DEFAULT 'medium', -- 'critical' | 'high' | 'medium' | 'low' | 'info'
+    status TEXT NOT NULL DEFAULT 'identified', -- 'identified' | 'investigating' | 'mitigated' | 'accepted' | 'resolved'
+    mitigation TEXT,                 -- notes on mitigation/remediation
+    cvss_score REAL,                 -- optional CVSS 3.1 base score
+    evidence TEXT,                   -- JSON: links, screenshots, request IDs
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(scope_id) REFERENCES scopes(id) ON DELETE SET NULL
+  );
 `);
 
 // Migration: Add 'phase' column to 'automation_jobs' if it doesn't exist
@@ -212,6 +253,8 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_auth_flows_scope_id ON auth_flows(scope_id);
   CREATE INDEX IF NOT EXISTS idx_extension_tokens_scope_id ON extension_tokens(scope_id);
   CREATE INDEX IF NOT EXISTS idx_stack_gap_findings_created ON stack_gap_findings(created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_stride_threats_scope_id ON stride_threats(scope_id);
+  CREATE INDEX IF NOT EXISTS idx_stride_threats_category ON stride_threats(category);
 `);
 
 // --- Crash recovery: mark orphaned 'running' scans/jobs as 'failed' ---

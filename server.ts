@@ -240,12 +240,34 @@ async function startServer() {
       // Layer per-endpoint custom headers (won't overwrite explicit headers)
       finalHeaders = EndpointHeaders.mergeHeaders(url, finalHeaders);
 
+      // Apply enabled match-replace rules in priority order
+      let effectiveMethod = method;
+      let effectiveUrl = url;
+      let effectiveBody = body;
+      const mrRules = db.prepare("SELECT * FROM match_replace_rules WHERE enabled = 1 ORDER BY priority ASC").all() as {
+        target: string; match_type: string; match_pattern: string; replace_value: string;
+      }[];
+      for (const rule of mrRules) {
+        const re = rule.match_type === 'regex' ? new RegExp(rule.match_pattern, 'g') : null;
+        const doReplace = (s: string) => re ? s.replace(re, rule.replace_value) : s.split(rule.match_pattern).join(rule.replace_value);
+        switch (rule.target) {
+          case 'url': effectiveUrl = doReplace(effectiveUrl); break;
+          case 'method': effectiveMethod = doReplace(effectiveMethod); break;
+          case 'header': {
+            const hs = JSON.stringify(finalHeaders);
+            finalHeaders = JSON.parse(doReplace(hs));
+            break;
+          }
+          case 'body': if (typeof effectiveBody === 'string') effectiveBody = doReplace(effectiveBody); break;
+        }
+      }
+
       const startTime = Date.now();
       const response = await axios({
-        method,
-        url,
+        method: effectiveMethod,
+        url: effectiveUrl,
         headers: finalHeaders,
-        data: body,
+        data: effectiveBody,
         validateStatus: () => true,
         timeout: 10000
       });
@@ -256,17 +278,35 @@ async function startServer() {
 
       // Save request/response for history/diff
       db.prepare('INSERT INTO requests (id, method, url, headers, body) VALUES (?, ?, ?, ?, ?)')
-        .run(requestId, method, url, JSON.stringify(finalHeaders), typeof body === 'string' ? body : JSON.stringify(body));
+        .run(requestId, effectiveMethod, effectiveUrl, JSON.stringify(finalHeaders), typeof effectiveBody === 'string' ? effectiveBody : JSON.stringify(effectiveBody));
       
       db.prepare('INSERT INTO responses (id, request_id, status, headers, body) VALUES (?, ?, ?, ?, ?)')
         .run(responseId, requestId, response.status, JSON.stringify(response.headers), typeof response.data === 'string' ? response.data : JSON.stringify(response.data));
+
+      // Inline STRIDE analysis on every proxied response
+      let strideHints = 0;
+      try {
+        let scopeIdForStride: string | null = null;
+        try {
+          const targetHost = new URL(effectiveUrl).hostname;
+          const matchedScope = (db.prepare('SELECT id, domain FROM scopes').all() as { id: string; domain: string }[])
+            .find(s => targetHost === s.domain || targetHost.endsWith(`.${s.domain}`));
+          if (matchedScope) scopeIdForStride = matchedScope.id;
+        } catch { /* ignore */ }
+        strideHints = strideAnalyzeSingleResponse(
+          effectiveUrl, effectiveMethod, finalHeaders,
+          response.headers as Record<string, string>, response.status, scopeIdForStride,
+        );
+      } catch { /* non-critical */ }
 
       res.json({
         id: responseId,
         status: response.status,
         headers: response.headers,
         body: response.data,
-        duration
+        duration,
+        matchReplaceApplied: mrRules.length,
+        strideHints,
       });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -970,6 +1010,817 @@ async function startServer() {
     }
   });
 
+  app.post('/api/browser/navigate', async (req, res) => {
+    try {
+      const { url: navUrl } = req.body as { url: string };
+      if (!navUrl) return res.status(400).json({ error: 'url is required' });
+      const browser = BrowserManager.getBrowserOrThrow();
+      const pages = await browser.pages();
+      const page = pages[pages.length - 1] ?? await BrowserManager.newPage();
+      await page.goto(navUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      res.json(await BrowserManager.status());
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  // --- Match & Replace rules ---
+  // Rules that modify outgoing proxy requests in-flight.  Applied in priority
+  // order before every /api/lab/proxy dispatch.
+
+  app.get('/api/match-replace', (_req, res) => {
+    const rules = db.prepare('SELECT * FROM match_replace_rules ORDER BY priority ASC, created_at ASC').all();
+    res.json(rules);
+  });
+
+  app.post('/api/match-replace', (req, res) => {
+    try {
+      const { name, target, matchType, matchPattern, replaceValue, priority, enabled } = req.body as {
+        name: string;
+        target: string;
+        matchType?: string;
+        matchPattern: string;
+        replaceValue: string;
+        priority?: number;
+        enabled?: boolean;
+      };
+      if (!name || !target || !matchPattern) {
+        return res.status(400).json({ error: 'name, target, and matchPattern are required' });
+      }
+      const id = uuidv4();
+      db.prepare(
+        'INSERT INTO match_replace_rules (id, name, target, match_type, match_pattern, replace_value, priority, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      ).run(id, name, target, matchType ?? 'literal', matchPattern, replaceValue ?? '', priority ?? 0, enabled === false ? 0 : 1);
+      const created = db.prepare('SELECT * FROM match_replace_rules WHERE id = ?').get(id);
+      res.json(created);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.patch('/api/match-replace/:id', (req, res) => {
+    try {
+      const existing = db.prepare('SELECT id FROM match_replace_rules WHERE id = ?').get(req.params.id);
+      if (!existing) return res.status(404).json({ error: 'Rule not found' });
+      const { name, target, matchType, matchPattern, replaceValue, priority, enabled } = req.body as {
+        name?: string; target?: string; matchType?: string; matchPattern?: string;
+        replaceValue?: string; priority?: number; enabled?: boolean;
+      };
+      const sets: string[] = [];
+      const vals: unknown[] = [];
+      if (name !== undefined) { sets.push('name = ?'); vals.push(name); }
+      if (target !== undefined) { sets.push('target = ?'); vals.push(target); }
+      if (matchType !== undefined) { sets.push('match_type = ?'); vals.push(matchType); }
+      if (matchPattern !== undefined) { sets.push('match_pattern = ?'); vals.push(matchPattern); }
+      if (replaceValue !== undefined) { sets.push('replace_value = ?'); vals.push(replaceValue); }
+      if (priority !== undefined) { sets.push('priority = ?'); vals.push(priority); }
+      if (enabled !== undefined) { sets.push('enabled = ?'); vals.push(enabled ? 1 : 0); }
+      if (sets.length > 0) {
+        sets.push("updated_at = datetime('now')");
+        vals.push(req.params.id);
+        db.prepare(`UPDATE match_replace_rules SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+      }
+      res.json(db.prepare('SELECT * FROM match_replace_rules WHERE id = ?').get(req.params.id));
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/match-replace/:id/toggle', (req, res) => {
+    const row = db.prepare('SELECT enabled FROM match_replace_rules WHERE id = ?').get(req.params.id) as { enabled: number } | undefined;
+    if (!row) return res.status(404).json({ error: 'Rule not found' });
+    const next = row.enabled ? 0 : 1;
+    db.prepare("UPDATE match_replace_rules SET enabled = ?, updated_at = datetime('now') WHERE id = ?").run(next, req.params.id);
+    res.json(db.prepare('SELECT * FROM match_replace_rules WHERE id = ?').get(req.params.id));
+  });
+
+  app.delete('/api/match-replace/:id', (req, res) => {
+    const result = db.prepare('DELETE FROM match_replace_rules WHERE id = ?').run(req.params.id);
+    if (result.changes === 0) return res.status(404).json({ error: 'Rule not found' });
+    res.json({ success: true });
+  });
+
+  app.delete('/api/match-replace', (_req, res) => {
+    const result = db.prepare('DELETE FROM match_replace_rules').run();
+    res.json({ success: true, deleted: result.changes });
+  });
+
+  // ── STRIDE Threat Model ─────────────────────────────────────────────────
+
+  const STRIDE_CATEGORIES = ['spoofing', 'tampering', 'repudiation', 'info_disclosure', 'dos', 'elevation'] as const;
+  const STRIDE_SEVERITIES = ['critical', 'high', 'medium', 'low', 'info'] as const;
+  const STRIDE_STATUSES = ['identified', 'investigating', 'mitigated', 'accepted', 'resolved'] as const;
+
+  app.get('/api/stride', (req, res) => {
+    try {
+      const { scopeId, category, status: statusFilter, severity } = req.query as {
+        scopeId?: string; category?: string; status?: string; severity?: string;
+      };
+      let sql = 'SELECT * FROM stride_threats WHERE 1=1';
+      const params: unknown[] = [];
+      if (scopeId) { sql += ' AND scope_id = ?'; params.push(scopeId); }
+      if (category) { sql += ' AND category = ?'; params.push(category); }
+      if (statusFilter) { sql += ' AND status = ?'; params.push(statusFilter); }
+      if (severity) { sql += ' AND severity = ?'; params.push(severity); }
+      sql += ' ORDER BY created_at DESC';
+      const threats = db.prepare(sql).all(...params);
+      res.json(threats);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/stride', (req, res) => {
+    try {
+      const { scopeId, category, title, description, affectedAsset, attackVector,
+              severity, status: threatStatus, mitigation, cvssScore, evidence } = req.body as {
+        scopeId?: string; category: string; title: string; description?: string;
+        affectedAsset?: string; attackVector?: string; severity?: string;
+        status?: string; mitigation?: string; cvssScore?: number; evidence?: string;
+      };
+      if (!category || !title) {
+        return res.status(400).json({ error: 'category and title are required' });
+      }
+      if (!STRIDE_CATEGORIES.includes(category as any)) {
+        return res.status(400).json({ error: `Invalid category. Must be one of: ${STRIDE_CATEGORIES.join(', ')}` });
+      }
+      const id = uuidv4();
+      db.prepare(
+        `INSERT INTO stride_threats (id, scope_id, category, title, description, affected_asset, attack_vector, severity, status, mitigation, cvss_score, evidence)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(id, scopeId ?? null, category, title, description ?? null,
+            affectedAsset ?? null, attackVector ?? null,
+            severity && STRIDE_SEVERITIES.includes(severity as any) ? severity : 'medium',
+            threatStatus && STRIDE_STATUSES.includes(threatStatus as any) ? threatStatus : 'identified',
+            mitigation ?? null, cvssScore ?? null, evidence ?? null);
+      const created = db.prepare('SELECT * FROM stride_threats WHERE id = ?').get(id);
+      res.json(created);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.patch('/api/stride/:id', (req, res) => {
+    try {
+      const existing = db.prepare('SELECT id FROM stride_threats WHERE id = ?').get(req.params.id);
+      if (!existing) return res.status(404).json({ error: 'Threat not found' });
+      const { scopeId, category, title, description, affectedAsset, attackVector,
+              severity, status: threatStatus, mitigation, cvssScore, evidence } = req.body as {
+        scopeId?: string; category?: string; title?: string; description?: string;
+        affectedAsset?: string; attackVector?: string; severity?: string;
+        status?: string; mitigation?: string; cvssScore?: number; evidence?: string;
+      };
+      const sets: string[] = [];
+      const vals: unknown[] = [];
+      if (scopeId !== undefined) { sets.push('scope_id = ?'); vals.push(scopeId); }
+      if (category !== undefined) { sets.push('category = ?'); vals.push(category); }
+      if (title !== undefined) { sets.push('title = ?'); vals.push(title); }
+      if (description !== undefined) { sets.push('description = ?'); vals.push(description); }
+      if (affectedAsset !== undefined) { sets.push('affected_asset = ?'); vals.push(affectedAsset); }
+      if (attackVector !== undefined) { sets.push('attack_vector = ?'); vals.push(attackVector); }
+      if (severity !== undefined) { sets.push('severity = ?'); vals.push(severity); }
+      if (threatStatus !== undefined) { sets.push('status = ?'); vals.push(threatStatus); }
+      if (mitigation !== undefined) { sets.push('mitigation = ?'); vals.push(mitigation); }
+      if (cvssScore !== undefined) { sets.push('cvss_score = ?'); vals.push(cvssScore); }
+      if (evidence !== undefined) { sets.push('evidence = ?'); vals.push(evidence); }
+      if (sets.length > 0) {
+        sets.push("updated_at = datetime('now')");
+        vals.push(req.params.id);
+        db.prepare(`UPDATE stride_threats SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+      }
+      res.json(db.prepare('SELECT * FROM stride_threats WHERE id = ?').get(req.params.id));
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.delete('/api/stride/:id', (req, res) => {
+    const result = db.prepare('DELETE FROM stride_threats WHERE id = ?').run(req.params.id);
+    if (result.changes === 0) return res.status(404).json({ error: 'Threat not found' });
+    res.json({ success: true });
+  });
+
+  app.delete('/api/stride', (_req, res) => {
+    const result = db.prepare('DELETE FROM stride_threats').run();
+    res.json({ success: true, deleted: result.changes });
+  });
+
+  // ── STRIDE helper: persist threat array and return count ──
+  type StrideHypothesis = { category: string; title: string; description: string; affectedAsset: string; attackVector: string; severity: string };
+  const strideInsertStmt = db.prepare(
+    `INSERT INTO stride_threats (id, scope_id, category, title, description, affected_asset, attack_vector, severity)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const stridePersist = (threats: StrideHypothesis[], scopeId: string | null) => {
+    db.transaction(() => {
+      for (const t of threats) {
+        strideInsertStmt.run(uuidv4(), scopeId ?? null, t.category, t.title, t.description, t.affectedAsset, t.attackVector, t.severity);
+      }
+    })();
+  };
+
+  // STRIDE auto-analyze: comprehensive threat hypothesis engine that pulls
+  // from endpoints, HTTP history, stack-gap findings, scan anomalies,
+  // session/credential/auth-flow data, and automation job findings.
+  // Deterministic heuristics — no AI dependency.
+  app.post('/api/stride/analyze', (req, res) => {
+    try {
+      const { scopeId } = req.body as { scopeId?: string };
+      const threats: StrideHypothesis[] = [];
+
+      // ── Gather all data sources ──
+      const endpoints = db.prepare('SELECT url, method FROM endpoints').all() as { url: string; method: string }[];
+      const historyRows = db.prepare(
+        'SELECT r.method, r.url, r.headers, resp.status, resp.headers as resp_headers FROM requests r LEFT JOIN responses resp ON resp.request_id = r.id ORDER BY r.created_at DESC LIMIT 500'
+      ).all() as { method: string; url: string; headers: string | null; status: number | null; resp_headers: string | null }[];
+      const stackGapFindings = db.prepare('SELECT * FROM stack_gap_findings').all() as { endpoint: string; mutation_type: string; confidence: string }[];
+      const scanAnomalies = db.prepare(
+        `SELECT sr.payload, sr.status, sr.length, s.target_url, s.baseline_status, s.baseline_length
+         FROM scan_results sr JOIN scans s ON sr.scan_id = s.id
+         WHERE sr.is_anomaly = 1 ORDER BY sr.created_at DESC LIMIT 100`
+      ).all() as { payload: string; status: number; length: number; target_url: string; baseline_status: number; baseline_length: number }[];
+      const sessions = db.prepare('SELECT s.*, sc.domain as scope_domain FROM sessions s JOIN scopes sc ON s.scope_id = sc.id').all() as {
+        id: string; scope_id: string; scope_domain: string; cookies: string | null; headers: string | null; user_agent: string | null;
+      }[];
+      const credentials = db.prepare('SELECT c.*, sc.domain as scope_domain FROM credentials c JOIN scopes sc ON c.scope_id = sc.id').all() as {
+        id: string; scope_id: string; scope_domain: string; label: string; username: string;
+      }[];
+      const authFlows = db.prepare(
+        'SELECT af.*, sc.domain as scope_domain FROM auth_flows af JOIN scopes sc ON af.scope_id = sc.id'
+      ).all() as {
+        id: string; scope_id: string; scope_domain: string; name: string; trigger_mode: string;
+        last_status: string | null; fail_count: number; success_count: number;
+      }[];
+      const automationJobs = db.prepare(
+        "SELECT * FROM automation_jobs WHERE status = 'completed' AND findings IS NOT NULL ORDER BY completed_at DESC LIMIT 20"
+      ).all() as { id: string; target_url: string; findings: string }[];
+
+      // Scope filtering
+      let scopeDomain: string | null = null;
+      if (scopeId) {
+        const scope = db.prepare('SELECT domain FROM scopes WHERE id = ?').get(scopeId) as { domain: string } | undefined;
+        scopeDomain = scope?.domain ?? null;
+      }
+      const inScope = (url: string) => {
+        if (!scopeDomain) return true;
+        try { return new URL(url).hostname.endsWith(scopeDomain); } catch { return false; }
+      };
+      const scopedEndpoints = endpoints.filter(e => inScope(e.url));
+      const scopedHistory = historyRows.filter(h => inScope(h.url));
+      const scopedSessions = sessions.filter(s => !scopeId || s.scope_id === scopeId);
+      const scopedCredentials = credentials.filter(c => !scopeId || c.scope_id === scopeId);
+      const scopedAuthFlows = authFlows.filter(af => !scopeId || af.scope_id === scopeId);
+      const scopedAnomalies = scanAnomalies.filter(a => inScope(a.target_url));
+
+      // ── S: Spoofing ──
+      for (const h of scopedHistory) {
+        let respHeaders: Record<string, string> = {};
+        try { respHeaders = h.resp_headers ? JSON.parse(h.resp_headers) : {}; } catch { /* ignore */ }
+        const hasAuth = h.headers && (h.headers.includes('Authorization') || h.headers.includes('Cookie'));
+        if (hasAuth && !respHeaders['strict-transport-security']) {
+          threats.push({
+            category: 'spoofing', title: 'Missing HSTS on authenticated endpoint',
+            description: 'Endpoint transmits authentication material without HSTS, enabling downgrade/MITM attacks.',
+            affectedAsset: h.url, attackVector: 'SSL stripping / MITM on authentication tokens', severity: 'high',
+          });
+          break;
+        }
+      }
+      for (const h of scopedHistory) {
+        let respHeaders: Record<string, string> = {};
+        try { respHeaders = h.resp_headers ? JSON.parse(h.resp_headers) : {}; } catch { /* ignore */ }
+        if (!respHeaders['x-frame-options'] && !respHeaders['content-security-policy']?.includes('frame-ancestors')) {
+          threats.push({
+            category: 'spoofing', title: 'Missing clickjacking protection',
+            description: 'No X-Frame-Options or CSP frame-ancestors header — page can be embedded in a malicious iframe.',
+            affectedAsset: h.url, attackVector: 'Iframe embedding for UI redress attacks', severity: 'medium',
+          });
+          break;
+        }
+      }
+      // Session cookie security analysis
+      for (const sess of scopedSessions) {
+        if (!sess.cookies) continue;
+        try {
+          const cookies = JSON.parse(sess.cookies) as { name: string; httpOnly?: boolean; secure?: boolean; sameSite?: string }[];
+          const insecure = cookies.filter(c => !c.secure || !c.httpOnly);
+          if (insecure.length > 0) {
+            threats.push({
+              category: 'spoofing',
+              title: `Insecure session cookies on ${sess.scope_domain}`,
+              description: `${insecure.length} cookie(s) missing Secure/HttpOnly flags: ${insecure.map(c => c.name).join(', ')}. Vulnerable to XSS theft or MITM interception.`,
+              affectedAsset: sess.scope_domain, attackVector: 'Cookie theft via XSS or network interception', severity: 'high',
+            });
+            break;
+          }
+        } catch { /* ignore */ }
+      }
+      // Auth flow failures indicate potential spoofing weaknesses
+      for (const af of scopedAuthFlows) {
+        if (af.fail_count > 0 && af.last_status === 'error') {
+          threats.push({
+            category: 'spoofing',
+            title: `Auth flow "${af.name}" has ${af.fail_count} failure(s)`,
+            description: `Unreliable authentication on ${af.scope_domain} — failed auth flows may indicate form changes, anti-automation, or auth bypass opportunities.`,
+            affectedAsset: af.scope_domain, attackVector: 'Authentication bypass via malformed/replayed auth flows', severity: 'medium',
+          });
+        }
+      }
+
+      // ── T: Tampering ──
+      for (const ep of scopedEndpoints) {
+        if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(ep.method.toUpperCase())) {
+          threats.push({
+            category: 'tampering', title: `State-changing ${ep.method} endpoint may lack CSRF protection`,
+            description: `${ep.method} ${ep.url} — verify anti-CSRF tokens or SameSite cookie enforcement.`,
+            affectedAsset: ep.url, attackVector: 'Cross-site request forgery via form/fetch from attacker-controlled page', severity: 'high',
+          });
+          break;
+        }
+      }
+      for (const f of stackGapFindings) {
+        threats.push({
+          category: 'tampering', title: `Stack gap: unexpected behavior on ${f.mutation_type} mutation`,
+          description: `Endpoint ${f.endpoint} responded differently to a ${f.mutation_type} mutation (confidence: ${f.confidence}). May indicate input validation gaps.`,
+          affectedAsset: f.endpoint, attackVector: `Parameter mutation: ${f.mutation_type}`,
+          severity: f.confidence === 'high' ? 'high' : 'medium',
+        });
+      }
+      // Scan anomalies → tampering hypotheses
+      for (const a of scopedAnomalies) {
+        if (a.status !== a.baseline_status) {
+          threats.push({
+            category: 'tampering',
+            title: `Fuzzing anomaly: payload "${a.payload.substring(0, 40)}" triggered ${a.status} (baseline ${a.baseline_status})`,
+            description: `Payload caused a different status code on ${a.target_url}. May indicate injection or input handling flaw.`,
+            affectedAsset: a.target_url, attackVector: `Payload injection: ${a.payload.substring(0, 80)}`,
+            severity: a.status >= 500 ? 'high' : 'medium',
+          });
+        }
+      }
+      // Missing Content-Security-Policy → script injection
+      for (const h of scopedHistory) {
+        let respHeaders: Record<string, string> = {};
+        try { respHeaders = h.resp_headers ? JSON.parse(h.resp_headers) : {}; } catch { /* ignore */ }
+        if (!respHeaders['content-security-policy']) {
+          threats.push({
+            category: 'tampering', title: 'Missing Content-Security-Policy header',
+            description: 'No CSP header — the application may be vulnerable to XSS and script injection attacks.',
+            affectedAsset: h.url, attackVector: 'Cross-site scripting via injected scripts', severity: 'high',
+          });
+          break;
+        }
+      }
+
+      // ── R: Repudiation ──
+      const hasAuditEndpoint = scopedEndpoints.some(e => /audit|log|event/i.test(e.url));
+      if (!hasAuditEndpoint && scopedEndpoints.length > 0) {
+        threats.push({
+          category: 'repudiation', title: 'No audit/logging endpoints detected',
+          description: 'No API endpoints related to audit trails were found in recon. Users may deny actions without evidence.',
+          affectedAsset: scopeDomain ?? 'all endpoints', attackVector: 'Denial of performed actions due to insufficient logging', severity: 'medium',
+        });
+      }
+      // Multiple credentials per scope without MFA → repudiation risk
+      const credByScopeId = new Map<string, number>();
+      for (const c of scopedCredentials) {
+        credByScopeId.set(c.scope_id, (credByScopeId.get(c.scope_id) ?? 0) + 1);
+      }
+      for (const [sid, count] of credByScopeId) {
+        if (count > 1) {
+          const domain = scopedCredentials.find(c => c.scope_id === sid)?.scope_domain;
+          threats.push({
+            category: 'repudiation',
+            title: `${count} credentials stored for ${domain ?? 'scope'} — shared accounts?`,
+            description: `Multiple credential sets for the same scope may indicate shared accounts. Without individual accountability, actions become repudiable.`,
+            affectedAsset: domain ?? sid, attackVector: 'Shared credentials undermine audit trails', severity: 'medium',
+          });
+        }
+      }
+
+      // ── I: Information Disclosure ──
+      for (const h of scopedHistory) {
+        let respHeaders: Record<string, string> = {};
+        try { respHeaders = h.resp_headers ? JSON.parse(h.resp_headers) : {}; } catch { /* ignore */ }
+        const serverHeader = respHeaders['server'] || respHeaders['x-powered-by'];
+        if (serverHeader) {
+          threats.push({
+            category: 'info_disclosure', title: 'Server technology disclosed via response headers',
+            description: `Server/X-Powered-By header reveals: "${serverHeader}". Aids attacker fingerprinting.`,
+            affectedAsset: h.url, attackVector: 'Technology fingerprinting via response headers', severity: 'low',
+          });
+          break;
+        }
+      }
+      for (const h of scopedHistory) {
+        if (h.status && h.status >= 500) {
+          threats.push({
+            category: 'info_disclosure', title: 'Server error response may leak internal details',
+            description: `HTTP ${h.status} from ${h.url} — 5xx errors often contain stack traces or debug info.`,
+            affectedAsset: h.url, attackVector: 'Error-based information leakage', severity: 'medium',
+          });
+          break;
+        }
+      }
+      for (const h of scopedHistory) {
+        let respHeaders: Record<string, string> = {};
+        try { respHeaders = h.resp_headers ? JSON.parse(h.resp_headers) : {}; } catch { /* ignore */ }
+        const cors = respHeaders['access-control-allow-origin'];
+        if (cors === '*') {
+          threats.push({
+            category: 'info_disclosure', title: 'Wildcard CORS policy detected',
+            description: `Access-Control-Allow-Origin: * on ${h.url} — any origin can read responses.`,
+            affectedAsset: h.url, attackVector: 'Cross-origin data theft via permissive CORS', severity: 'high',
+          });
+          break;
+        }
+      }
+      // Scan anomalies with large response size changes → data leaks
+      for (const a of scopedAnomalies) {
+        if (a.length > a.baseline_length * 2 && a.baseline_length > 0) {
+          threats.push({
+            category: 'info_disclosure',
+            title: `Anomalous response size (${a.length} vs baseline ${a.baseline_length})`,
+            description: `Payload "${a.payload.substring(0, 40)}" caused a ${Math.round(a.length / a.baseline_length)}x larger response on ${a.target_url}. May indicate data exfiltration or verbose error.`,
+            affectedAsset: a.target_url, attackVector: 'Input-triggered information leakage via response inflation', severity: 'medium',
+          });
+          break;
+        }
+      }
+      // Automation job findings → info disclosure
+      for (const job of automationJobs) {
+        if (!inScope(job.target_url)) continue;
+        try {
+          const findings = JSON.parse(job.findings) as { type?: string; description?: string; url?: string; severity?: string }[];
+          for (const f of findings) {
+            if (f.type && /disclosure|leak|expos/i.test(f.type)) {
+              threats.push({
+                category: 'info_disclosure',
+                title: `AutoHunt finding: ${f.description?.substring(0, 60) ?? f.type}`,
+                description: f.description ?? `Automation hunt detected: ${f.type}`,
+                affectedAsset: f.url ?? job.target_url, attackVector: f.type, severity: f.severity ?? 'medium',
+              });
+            }
+          }
+        } catch { /* ignore */ }
+      }
+
+      // ── D: Denial of Service ──
+      const hasRateLimitHeaders = scopedHistory.some(h => {
+        try {
+          const rh = h.resp_headers ? JSON.parse(h.resp_headers) : {};
+          return rh['x-ratelimit-limit'] || rh['ratelimit-limit'] || rh['retry-after'];
+        } catch { return false; }
+      });
+      if (!hasRateLimitHeaders && scopedHistory.length > 0) {
+        threats.push({
+          category: 'dos', title: 'No rate-limiting headers observed',
+          description: 'None of the observed responses include rate-limit headers. Endpoints may be vulnerable to abuse.',
+          affectedAsset: scopeDomain ?? 'all endpoints', attackVector: 'Resource exhaustion via unthrottled request flooding', severity: 'medium',
+        });
+      }
+      // File upload or large body endpoints → DoS via resource exhaustion
+      for (const ep of scopedEndpoints) {
+        if (/upload|import|file|media|image|attach/i.test(ep.url) && ep.method.toUpperCase() === 'POST') {
+          threats.push({
+            category: 'dos', title: `File upload endpoint may lack size limits: ${ep.url}`,
+            description: 'POST to upload-like endpoint — verify server-side file size and type validation.',
+            affectedAsset: ep.url, attackVector: 'Oversized file upload causing disk/memory exhaustion', severity: 'medium',
+          });
+        }
+      }
+
+      // ── E: Elevation of Privilege ──
+      for (const ep of scopedEndpoints) {
+        if (/admin|manage|role|permission|user.*create|user.*delete|sudo|superuser|grant/i.test(ep.url)) {
+          threats.push({
+            category: 'elevation', title: 'Privileged endpoint detected — verify authorization',
+            description: `${ep.method} ${ep.url} appears to be an admin/privileged endpoint. Ensure proper role checks.`,
+            affectedAsset: ep.url, attackVector: 'IDOR or missing authorization checks on privileged operations', severity: 'critical',
+          });
+        }
+      }
+      for (const h of scopedHistory) {
+        let reqHeaders: Record<string, string> = {};
+        try { reqHeaders = h.headers ? JSON.parse(h.headers) : {}; } catch { /* ignore */ }
+        if (reqHeaders['authorization']?.toLowerCase().startsWith('bearer ')) {
+          threats.push({
+            category: 'elevation', title: 'JWT/Bearer token detected — verify token validation',
+            description: 'Bearer tokens may be vulnerable to algorithm confusion, weak signing, or missing expiry checks.',
+            affectedAsset: h.url, attackVector: 'JWT manipulation: none algorithm, key confusion, expired token reuse', severity: 'high',
+          });
+          break;
+        }
+      }
+      // Automation job findings → elevation
+      for (const job of automationJobs) {
+        if (!inScope(job.target_url)) continue;
+        try {
+          const findings = JSON.parse(job.findings) as { type?: string; description?: string; url?: string; severity?: string }[];
+          for (const f of findings) {
+            if (f.type && /idor|priv|auth.*bypass|escalat/i.test(f.type)) {
+              threats.push({
+                category: 'elevation',
+                title: `AutoHunt finding: ${f.description?.substring(0, 60) ?? f.type}`,
+                description: f.description ?? `Automation hunt detected: ${f.type}`,
+                affectedAsset: f.url ?? job.target_url, attackVector: f.type, severity: f.severity ?? 'high',
+              });
+            }
+          }
+        } catch { /* ignore */ }
+      }
+      // Session without scope-bound auth flow → elevation risk
+      for (const sess of scopedSessions) {
+        const hasFlow = scopedAuthFlows.some(af => af.scope_id === sess.scope_id);
+        if (!hasFlow) {
+          threats.push({
+            category: 'elevation',
+            title: `Session on ${sess.scope_domain} has no bound auth flow`,
+            description: 'Captured session has no automated auth-flow macro — if the session expires, manual re-auth is needed. Consider whether session fixation or reuse attacks apply.',
+            affectedAsset: sess.scope_domain, attackVector: 'Session fixation or stale session reuse', severity: 'low',
+          });
+          break;
+        }
+      }
+
+      // Persist generated threats
+      stridePersist(threats, scopeId ?? null);
+
+      res.json({ generated: threats.length, threats });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // STRIDE: generate threats from a single proxy response (called inline by lab/proxy).
+  // Lightweight — only checks headers on a single response.
+  function strideAnalyzeSingleResponse(
+    url: string, method: string,
+    reqHeaders: Record<string, string>, respHeaders: Record<string, string>,
+    status: number, scopeId: string | null,
+  ) {
+    const threats: StrideHypothesis[] = [];
+    const hasAuth = reqHeaders['authorization'] || reqHeaders['cookie'];
+    if (hasAuth && !respHeaders['strict-transport-security']) {
+      threats.push({
+        category: 'spoofing', title: 'Missing HSTS on authenticated endpoint',
+        description: `${method} ${url} — authenticated request without HSTS.`,
+        affectedAsset: url, attackVector: 'SSL stripping / MITM', severity: 'high',
+      });
+    }
+    if (respHeaders['access-control-allow-origin'] === '*') {
+      threats.push({
+        category: 'info_disclosure', title: 'Wildcard CORS on this endpoint',
+        description: `Access-Control-Allow-Origin: * on ${url}`,
+        affectedAsset: url, attackVector: 'Cross-origin data theft', severity: 'high',
+      });
+    }
+    if (status >= 500) {
+      threats.push({
+        category: 'info_disclosure', title: `Server error ${status} may leak details`,
+        description: `HTTP ${status} from ${method} ${url}`,
+        affectedAsset: url, attackVector: 'Error-based leakage', severity: 'medium',
+      });
+    }
+    if (threats.length > 0) stridePersist(threats, scopeId);
+    return threats.length;
+  }
+
+  // STRIDE: hook for scan completion — generate threats from scan anomalies
+  app.post('/api/stride/from-scan/:scanId', (req, res) => {
+    try {
+      const scan = db.prepare('SELECT * FROM scans WHERE id = ?').get(req.params.scanId) as {
+        id: string; target_url: string; baseline_status: number; baseline_length: number;
+      } | undefined;
+      if (!scan) return res.status(404).json({ error: 'Scan not found' });
+
+      const anomalies = db.prepare(
+        'SELECT * FROM scan_results WHERE scan_id = ? AND is_anomaly = 1'
+      ).all(req.params.scanId) as { payload: string; status: number; length: number }[];
+
+      const threats: StrideHypothesis[] = [];
+      for (const a of anomalies) {
+        if (a.status !== scan.baseline_status) {
+          threats.push({
+            category: 'tampering',
+            title: `Scan anomaly: "${a.payload.substring(0, 40)}" → HTTP ${a.status}`,
+            description: `Payload caused status ${a.status} (baseline ${scan.baseline_status}) on ${scan.target_url}.`,
+            affectedAsset: scan.target_url, attackVector: `Fuzzing payload: ${a.payload.substring(0, 80)}`,
+            severity: a.status >= 500 ? 'high' : 'medium',
+          });
+        }
+        if (a.length > scan.baseline_length * 2 && scan.baseline_length > 0) {
+          threats.push({
+            category: 'info_disclosure',
+            title: `Scan anomaly: ${a.length}B response (${Math.round(a.length / scan.baseline_length)}x baseline)`,
+            description: `Payload "${a.payload.substring(0, 40)}" inflated response on ${scan.target_url}.`,
+            affectedAsset: scan.target_url, attackVector: 'Response inflation via crafted input', severity: 'medium',
+          });
+        }
+      }
+
+      // Resolve scope for the scan target
+      let scopeId: string | null = null;
+      try {
+        const host = new URL(scan.target_url.replace('§FUZZ§', 'x')).hostname;
+        const scope = db.prepare('SELECT id, domain FROM scopes').all() as { id: string; domain: string }[];
+        const match = scope.find(s => host === s.domain || host.endsWith(`.${s.domain}`));
+        if (match) scopeId = match.id;
+      } catch { /* ignore */ }
+
+      stridePersist(threats, scopeId);
+      res.json({ generated: threats.length, threats });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // STRIDE: hook for automation job completion — generate threats from findings
+  app.post('/api/stride/from-job/:jobId', (req, res) => {
+    try {
+      const job = db.prepare('SELECT * FROM automation_jobs WHERE id = ?').get(req.params.jobId) as {
+        id: string; target_url: string; findings: string | null;
+      } | undefined;
+      if (!job) return res.status(404).json({ error: 'Job not found' });
+      if (!job.findings) return res.json({ generated: 0, threats: [] });
+
+      const findings = JSON.parse(job.findings) as { type?: string; description?: string; url?: string; severity?: string }[];
+      const threats: StrideHypothesis[] = [];
+
+      for (const f of findings) {
+        let category = 'tampering';
+        if (f.type && /spoof|phish|impersonat/i.test(f.type)) category = 'spoofing';
+        else if (f.type && /disclosure|leak|expos/i.test(f.type)) category = 'info_disclosure';
+        else if (f.type && /dos|flood|exhaust/i.test(f.type)) category = 'dos';
+        else if (f.type && /idor|priv|auth.*bypass|escalat/i.test(f.type)) category = 'elevation';
+        else if (f.type && /repudi|audit|log/i.test(f.type)) category = 'repudiation';
+
+        threats.push({
+          category,
+          title: f.description?.substring(0, 120) ?? f.type ?? 'AutoHunt finding',
+          description: f.description ?? `Automated hunt detected: ${f.type}`,
+          affectedAsset: f.url ?? job.target_url,
+          attackVector: f.type ?? 'automated detection',
+          severity: f.severity ?? 'medium',
+        });
+      }
+
+      let scopeId: string | null = null;
+      try {
+        const host = new URL(job.target_url).hostname;
+        const scope = db.prepare('SELECT id, domain FROM scopes').all() as { id: string; domain: string }[];
+        const match = scope.find(s => host === s.domain || host.endsWith(`.${s.domain}`));
+        if (match) scopeId = match.id;
+      } catch { /* ignore */ }
+
+      stridePersist(threats, scopeId);
+      res.json({ generated: threats.length, threats });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // STRIDE: export all threats as JSON report
+  app.get('/api/stride/export', (req, res) => {
+    try {
+      const { scopeId, format } = req.query as { scopeId?: string; format?: string };
+      let sql = 'SELECT t.*, s.domain as scope_domain FROM stride_threats t LEFT JOIN scopes s ON t.scope_id = s.id';
+      const params: unknown[] = [];
+      if (scopeId) { sql += ' WHERE t.scope_id = ?'; params.push(scopeId); }
+      sql += ' ORDER BY t.category, t.severity DESC, t.created_at DESC';
+      const threats = db.prepare(sql).all(...params) as (StrideHypothesis & { id: string; scope_domain: string | null; status: string; mitigation: string | null; cvss_score: number | null; affected_asset: string | null; attack_vector: string | null; created_at: string; updated_at: string })[];
+
+      if (format === 'markdown') {
+        const lines: string[] = ['# STRIDE Threat Model Report', '', `Generated: ${new Date().toISOString()}`, `Total threats: ${threats.length}`, ''];
+        for (const cat of STRIDE_CATEGORIES) {
+          const catThreats = threats.filter(t => t.category === cat);
+          if (catThreats.length === 0) continue;
+          const label = { spoofing: 'Spoofing', tampering: 'Tampering', repudiation: 'Repudiation', info_disclosure: 'Information Disclosure', dos: 'Denial of Service', elevation: 'Elevation of Privilege' }[cat] ?? cat;
+          lines.push(`## ${label} (${catThreats.length})`, '');
+          for (const t of catThreats) {
+            lines.push(`### [${t.severity.toUpperCase()}] ${t.title}`, '');
+            if (t.description) lines.push(t.description, '');
+            if (t.affected_asset) lines.push(`**Affected Asset:** ${t.affected_asset}`);
+            if (t.attack_vector) lines.push(`**Attack Vector:** ${t.attack_vector}`);
+            lines.push(`**Status:** ${t.status}`);
+            if (t.mitigation) lines.push(`**Mitigation:** ${t.mitigation}`);
+            if (t.cvss_score != null) lines.push(`**CVSS:** ${t.cvss_score}`);
+            lines.push('');
+          }
+        }
+        res.setHeader('Content-Type', 'text/markdown');
+        res.setHeader('Content-Disposition', 'attachment; filename="stride-report.md"');
+        res.send(lines.join('\n'));
+      } else {
+        res.json({
+          generated_at: new Date().toISOString(),
+          total: threats.length,
+          by_category: Object.fromEntries(
+            STRIDE_CATEGORIES.map(c => [c, threats.filter(t => t.category === c)])
+          ),
+          threats,
+        });
+      }
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // STRIDE summary stats per category
+  app.get('/api/stride/summary', (req, res) => {
+    try {
+      const { scopeId } = req.query as { scopeId?: string };
+      let filter = '';
+      const params: unknown[] = [];
+      if (scopeId) { filter = ' WHERE scope_id = ?'; params.push(scopeId); }
+      const rows = db.prepare(
+        `SELECT category, severity, COUNT(*) as count FROM stride_threats${filter} GROUP BY category, severity`
+      ).all(...params) as { category: string; severity: string; count: number }[];
+      const byCategory: Record<string, { total: number; bySeverity: Record<string, number> }> = {};
+      for (const cat of STRIDE_CATEGORIES) {
+        byCategory[cat] = { total: 0, bySeverity: {} };
+      }
+      for (const row of rows) {
+        if (!byCategory[row.category]) byCategory[row.category] = { total: 0, bySeverity: {} };
+        byCategory[row.category].total += row.count;
+        byCategory[row.category].bySeverity[row.severity] = row.count;
+      }
+      const total = rows.reduce((s, r) => s + r.count, 0);
+      res.json({ total, byCategory });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Replay: re-send a request from history through the proxy, applying active
+  // match-replace rules. Returns the fresh response.
+  app.post('/api/history/:requestId/replay', async (req, res) => {
+    try {
+      const original = db.prepare('SELECT method, url, headers, body FROM requests WHERE id = ?').get(req.params.requestId) as
+        { method: string; url: string; headers: string | null; body: string | null } | undefined;
+      if (!original) return res.status(404).json({ error: 'Request not found' });
+
+      let rMethod = original.method;
+      let rUrl = original.url;
+      let rHeaders: Record<string, string> = {};
+      try { rHeaders = original.headers ? JSON.parse(original.headers) : {}; } catch { /* keep empty */ }
+      let rBody: string | null = original.body;
+
+      // Apply enabled match-replace rules
+      const rules = db.prepare("SELECT * FROM match_replace_rules WHERE enabled = 1 ORDER BY priority ASC").all() as {
+        target: string; match_type: string; match_pattern: string; replace_value: string;
+      }[];
+      for (const rule of rules) {
+        const re = rule.match_type === 'regex' ? new RegExp(rule.match_pattern, 'g') : null;
+        const doReplace = (s: string) => re ? s.replace(re, rule.replace_value) : s.split(rule.match_pattern).join(rule.replace_value);
+        switch (rule.target) {
+          case 'url': rUrl = doReplace(rUrl); break;
+          case 'method': rMethod = doReplace(rMethod); break;
+          case 'header': {
+            const headersStr = JSON.stringify(rHeaders);
+            rHeaders = JSON.parse(doReplace(headersStr));
+            break;
+          }
+          case 'body': if (rBody) rBody = doReplace(rBody); break;
+        }
+      }
+
+      // Layer per-endpoint custom headers
+      rHeaders = EndpointHeaders.mergeHeaders(rUrl, rHeaders);
+
+      const startTime = Date.now();
+      const response = await axios({
+        method: rMethod as any,
+        url: rUrl,
+        headers: rHeaders,
+        data: rBody ?? undefined,
+        validateStatus: () => true,
+        timeout: 10000,
+      });
+      const duration = Date.now() - startTime;
+
+      const requestId = uuidv4();
+      const responseId = uuidv4();
+      db.prepare('INSERT INTO requests (id, method, url, headers, body) VALUES (?, ?, ?, ?, ?)')
+        .run(requestId, rMethod, rUrl, JSON.stringify(rHeaders), rBody);
+      db.prepare('INSERT INTO responses (id, request_id, status, headers, body) VALUES (?, ?, ?, ?, ?)')
+        .run(responseId, requestId, response.status, JSON.stringify(response.headers),
+          typeof response.data === 'string' ? response.data : JSON.stringify(response.data));
+
+      res.json({
+        id: responseId,
+        requestId,
+        status: response.status,
+        headers: response.headers,
+        body: response.data,
+        duration,
+        appliedRules: rules.length,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // Fuzzing Engine
   app.post('/api/scans', async (req, res) => {
     const { targetUrl, payloadSetId, method, headers, body, sessionId } = req.body as {
@@ -1084,6 +1935,33 @@ async function startServer() {
         }
 
         db.prepare('UPDATE scans SET status = ? WHERE id = ?').run('completed', scanId);
+
+        // Auto-generate STRIDE threats from scan anomalies
+        try {
+          const anomalies = db.prepare('SELECT * FROM scan_results WHERE scan_id = ? AND is_anomaly = 1').all(scanId) as { payload: string; status: number; length: number }[];
+          if (anomalies.length > 0) {
+            let scanScopeId: string | null = null;
+            try {
+              const host = new URL(targetUrl.replace('§FUZZ§', 'x')).hostname;
+              const scope = db.prepare('SELECT id, domain FROM scopes').all() as { id: string; domain: string }[];
+              const match = scope.find(s => host === s.domain || host.endsWith(`.${s.domain}`));
+              if (match) scanScopeId = match.id;
+            } catch { /* ignore */ }
+            const scanThreats: StrideHypothesis[] = [];
+            for (const a of anomalies.slice(0, 20)) {
+              if (a.status !== baselineStatus) {
+                scanThreats.push({
+                  category: 'tampering',
+                  title: `Scan anomaly: "${a.payload.substring(0, 40)}" → HTTP ${a.status}`,
+                  description: `Payload caused status ${a.status} (baseline ${baselineStatus}) on ${targetUrl}.`,
+                  affectedAsset: targetUrl, attackVector: `Fuzzing payload: ${a.payload.substring(0, 80)}`,
+                  severity: a.status >= 500 ? 'high' : 'medium',
+                });
+              }
+            }
+            if (scanThreats.length > 0) stridePersist(scanThreats, scanScopeId);
+          }
+        } catch { /* non-critical — don't fail the scan for STRIDE */ }
       } catch (err) {
         console.error('Scan error:', err);
         db.prepare('UPDATE scans SET status = ? WHERE id = ?').run('failed', scanId);
@@ -1183,10 +2061,12 @@ async function startServer() {
       const findings = (db.prepare('SELECT COUNT(*) as c FROM stack_gap_findings').get() as any).c;
       const authFlows = (db.prepare('SELECT COUNT(*) as c FROM auth_flows').get() as any).c;
       const requests = (db.prepare('SELECT COUNT(*) as c FROM requests').get() as any).c;
+      const matchReplaceRules = (db.prepare('SELECT COUNT(*) as c FROM match_replace_rules').get() as any).c;
+      const strideThreats = (db.prepare('SELECT COUNT(*) as c FROM stride_threats').get() as any).c;
       res.json({
         scopes, endpoints, payloads, flows, sessions, credentials,
         scans, runningScans, automationJobs, runningJobs, findings,
-        authFlows, requests,
+        authFlows, requests, matchReplaceRules, strideThreats,
       });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
