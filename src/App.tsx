@@ -4,7 +4,7 @@ import {
   Activity, LayoutDashboard, Binary, Layers, History, Target,
   Globe, KeyRound, Lock, LogIn, Smartphone, ChevronDown, ChevronRight,
   Compass, Crosshair, Beaker, Wrench, Archive, UserCheck,
-  Menu, X, Info, Replace,
+  Menu, X, Info, Replace, ShieldAlert,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
@@ -34,6 +34,7 @@ import WafPanel from './components/WafPanel';
 import OriginIpPanel from './components/OriginIpPanel';
 import EndpointHeadersPanel from './components/EndpointHeadersPanel';
 import MatchReplacePanel from './components/MatchReplacePanel';
+import StridePanel from './components/StridePanel';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -45,6 +46,7 @@ type View =
   | 'identity' | 'browser' | 'sessions' | 'credentials' | 'authflows' | 'osbridge'
   | 'automation' | 'lab' | 'scanner' | 'stackgap' | 'flows' | 'waf' | 'originip'
   | 'encoder' | 'payloads' | 'endpointheaders' | 'matchreplace'
+  | 'stride'
   | 'history'
   | 'about';
 
@@ -95,6 +97,7 @@ const NAV_SECTIONS: NavSection[] = [
       { id: 'stackgap', label: 'Stack Gap', icon: Layers },
       { id: 'waf', label: 'WAF Analysis', icon: Shield },
       { id: 'originip', label: 'Origin IP', icon: Globe },
+      { id: 'stride', label: 'STRIDE Model', icon: ShieldAlert },
       { id: 'flows', label: 'State Engine', icon: GitBranch },
     ],
   },
@@ -416,6 +419,8 @@ export default function App() {
               {activeView === 'payloads' && <PayloadManager />}
               {activeView === 'endpointheaders' && <EndpointHeadersPanel />}
               {activeView === 'matchreplace' && <MatchReplacePanel />}
+
+              {activeView === 'stride' && <StridePanel />}
 
               {activeView === 'history' && <HttpHistory />}
 
