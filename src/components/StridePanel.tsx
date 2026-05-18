@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import {
   ShieldAlert, Plus, Trash2, RefreshCw, Play, ChevronDown,
   AlertTriangle, Eye, EyeOff, Filter, X, Edit3, Save, Target,
+  Download, FileText,
 } from 'lucide-react';
 
 interface StrideThreat {
@@ -257,12 +258,26 @@ export default function StridePanel() {
             <RefreshCw className="w-4 h-4" />
           </button>
           {threats.length > 0 && (
-            <button
-              onClick={handleClearAll}
-              className="flex items-center gap-1 px-2 py-1.5 text-xs text-red-400 hover:text-red-300 hover:bg-red-500/20 rounded transition"
-            >
-              <Trash2 className="w-3.5 h-3.5" /> Clear
-            </button>
+            <>
+              <button
+                onClick={() => {
+                  const params = new URLSearchParams();
+                  if (filterScope) params.set('scopeId', filterScope);
+                  params.set('format', 'markdown');
+                  window.open(`/api/stride/export?${params}`, '_blank');
+                }}
+                className="flex items-center gap-1 px-2 py-1.5 text-xs text-cyan-400 hover:text-cyan-300 hover:bg-cyan-500/20 rounded transition"
+                title="Export report"
+              >
+                <Download className="w-3.5 h-3.5" /> Export
+              </button>
+              <button
+                onClick={handleClearAll}
+                className="flex items-center gap-1 px-2 py-1.5 text-xs text-red-400 hover:text-red-300 hover:bg-red-500/20 rounded transition"
+              >
+                <Trash2 className="w-3.5 h-3.5" /> Clear
+              </button>
+            </>
           )}
         </div>
       </div>
@@ -417,7 +432,8 @@ export default function StridePanel() {
             <div className="flex flex-col items-center justify-center h-full text-gray-500 gap-3">
               <ShieldAlert className="w-12 h-12 text-gray-700" />
               <p className="text-sm">No threats found</p>
-              <p className="text-xs text-gray-600">Click "Auto-Analyze" to generate threats from recon data, or add manually.</p>
+              <p className="text-xs text-gray-600">Click "Auto-Analyze" to generate threats from recon data, scan anomalies, sessions, and auth flows — or add manually.</p>
+              <p className="text-xs text-gray-700 mt-1">Threats are also auto-generated from Request Lab responses and completed scans.</p>
             </div>
           ) : (
             <div className="divide-y divide-gray-800/50">
