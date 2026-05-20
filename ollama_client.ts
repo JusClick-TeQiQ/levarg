@@ -76,13 +76,15 @@ export class OllamaClient {
     const backend = detectBackend();
     if (backend === 'cloudflare') {
       try {
-        // Lightweight check — just verify the token works
-        const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/models`;
-        await axios.get(url, {
-          headers: { Authorization: `Bearer ${CF_AI_TOKEN}` },
-          timeout: 5000,
+        const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${CF_AI_MODEL}`;
+        const res = await axios.post(url, {
+          messages: [{ role: 'user', content: 'ping' }],
+          max_tokens: 1,
+        }, {
+          headers: { Authorization: `Bearer ${CF_AI_TOKEN}`, 'Content-Type': 'application/json' },
+          timeout: 10_000,
         });
-        return true;
+        return res.data?.success === true;
       } catch { return false; }
     }
     if (backend === 'ollama') {
