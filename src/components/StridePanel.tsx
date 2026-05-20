@@ -168,7 +168,8 @@ export default function StridePanel() {
       });
       if (!res.ok) { const e = await res.json(); throw new Error(e.error); }
       const data = await res.json();
-      setError(`Generated ${data.generated} threat(s) from recon data`);
+      const dupMsg = data.newlyInserted < data.generated ? ` (${data.generated - data.newlyInserted} duplicates skipped)` : '';
+      setError(`Generated ${data.generated} threat(s), ${data.newlyInserted ?? data.generated} new${dupMsg}`);
       fetchThreats(); fetchSummary();
     } catch (err: any) {
       setError(err.message);
@@ -458,6 +459,14 @@ export default function StridePanel() {
                         <div className="flex items-center gap-2 text-[10px]">
                           {severityBadge(t.severity)}
                           {statusBadge(t.status)}
+                          {t.cvss_score != null && (
+                            <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                              t.cvss_score >= 9 ? 'bg-red-700/40 text-red-300' :
+                              t.cvss_score >= 7 ? 'bg-orange-700/40 text-orange-300' :
+                              t.cvss_score >= 4 ? 'bg-yellow-700/40 text-yellow-300' :
+                              'bg-gray-700/40 text-gray-400'
+                            }`}>{t.cvss_score}</span>
+                          )}
                           {t.affected_asset && (
                             <span className="text-gray-500 truncate max-w-[200px]">
                               <Target className="w-3 h-3 inline mr-0.5" />{t.affected_asset}

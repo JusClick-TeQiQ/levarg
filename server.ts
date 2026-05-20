@@ -1205,18 +1205,28 @@ async function startServer() {
     res.json({ success: true, deleted: result.changes });
   });
 
-  // ── STRIDE helper: persist threat array and return count ──
-  type StrideHypothesis = { category: string; title: string; description: string; affectedAsset: string; attackVector: string; severity: string };
+  // ── STRIDE helper: persist threat array with deduplication and auto-CVSS ──
+  type StrideHypothesis = { category: string; title: string; description: string; affectedAsset: string; attackVector: string; severity: string; cvss?: number };
   const strideInsertStmt = db.prepare(
-    `INSERT INTO stride_threats (id, scope_id, category, title, description, affected_asset, attack_vector, severity)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO stride_threats (id, scope_id, category, title, description, affected_asset, attack_vector, severity, cvss_score)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
+  const strideDupCheck = db.prepare(
+    `SELECT id FROM stride_threats WHERE category = ? AND title = ? AND affected_asset = ? LIMIT 1`
+  );
+  const CVSS_MAP: Record<string, number> = { critical: 9.5, high: 7.5, medium: 5.0, low: 2.5, info: 0.0 };
   const stridePersist = (threats: StrideHypothesis[], scopeId: string | null) => {
+    let inserted = 0;
     db.transaction(() => {
       for (const t of threats) {
-        strideInsertStmt.run(uuidv4(), scopeId ?? null, t.category, t.title, t.description, t.affectedAsset, t.attackVector, t.severity);
+        const dup = strideDupCheck.get(t.category, t.title, t.affectedAsset);
+        if (dup) continue;
+        const cvss = t.cvss ?? CVSS_MAP[t.severity] ?? 5.0;
+        strideInsertStmt.run(uuidv4(), scopeId ?? null, t.category, t.title, t.description, t.affectedAsset, t.attackVector, t.severity, cvss);
+        inserted++;
       }
     })();
+    return inserted;
   };
 
   // STRIDE auto-analyze: comprehensive threat hypothesis engine that pulls
@@ -1272,116 +1282,148 @@ async function startServer() {
       const scopedAuthFlows = authFlows.filter(af => !scopeId || af.scope_id === scopeId);
       const scopedAnomalies = scanAnomalies.filter(a => inScope(a.target_url));
 
-      // ── S: Spoofing ──
-      for (const h of scopedHistory) {
+      // Track unique URLs to avoid flooding with per-URL duplicates within same run
+      const seen = new Set<string>();
+      const pushUnique = (t: StrideHypothesis) => {
+        const key = `${t.category}|${t.title}|${t.affectedAsset}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        threats.push(t);
+      };
+
+      // Pre-parse all history response headers once for efficiency
+      const parsedHistory = scopedHistory.map(h => {
+        let reqHeaders: Record<string, string> = {};
         let respHeaders: Record<string, string> = {};
+        try { reqHeaders = h.headers ? JSON.parse(h.headers) : {}; } catch { /* ignore */ }
         try { respHeaders = h.resp_headers ? JSON.parse(h.resp_headers) : {}; } catch { /* ignore */ }
-        const hasAuth = h.headers && (h.headers.includes('Authorization') || h.headers.includes('Cookie'));
-        if (hasAuth && !respHeaders['strict-transport-security']) {
-          threats.push({
-            category: 'spoofing', title: 'Missing HSTS on authenticated endpoint',
-            description: 'Endpoint transmits authentication material without HSTS, enabling downgrade/MITM attacks.',
-            affectedAsset: h.url, attackVector: 'SSL stripping / MITM on authentication tokens', severity: 'high',
+        return { ...h, reqHeaders, respHeaders };
+      });
+
+      // ── S: Spoofing — analyze EVERY endpoint, not just the first match ──
+
+      // S1: Missing HSTS on authenticated endpoints
+      for (const h of parsedHistory) {
+        const hasAuth = h.reqHeaders['authorization'] || h.reqHeaders['cookie'];
+        if (hasAuth && !h.respHeaders['strict-transport-security']) {
+          pushUnique({
+            category: 'spoofing', title: `Missing HSTS on authenticated endpoint: ${h.url}`,
+            description: `${h.method} ${h.url} transmits auth material without HSTS — enables SSL stripping / MITM.`,
+            affectedAsset: h.url, attackVector: 'SSL stripping / MITM on authentication tokens', severity: 'high', cvss: 7.4,
           });
-          break;
         }
       }
-      for (const h of scopedHistory) {
-        let respHeaders: Record<string, string> = {};
-        try { respHeaders = h.resp_headers ? JSON.parse(h.resp_headers) : {}; } catch { /* ignore */ }
-        if (!respHeaders['x-frame-options'] && !respHeaders['content-security-policy']?.includes('frame-ancestors')) {
-          threats.push({
-            category: 'spoofing', title: 'Missing clickjacking protection',
-            description: 'No X-Frame-Options or CSP frame-ancestors header — page can be embedded in a malicious iframe.',
-            affectedAsset: h.url, attackVector: 'Iframe embedding for UI redress attacks', severity: 'medium',
-          });
-          break;
-        }
+      // S2: Missing clickjacking protection — per unique host
+      const clickjackHosts = new Set<string>();
+      for (const h of parsedHistory) {
+        try {
+          const host = new URL(h.url).hostname;
+          if (clickjackHosts.has(host)) continue;
+          if (!h.respHeaders['x-frame-options'] && !h.respHeaders['content-security-policy']?.includes('frame-ancestors')) {
+            clickjackHosts.add(host);
+            pushUnique({
+              category: 'spoofing', title: `Missing clickjacking protection on ${host}`,
+              description: `No X-Frame-Options or CSP frame-ancestors on responses from ${host}. Pages can be embedded in malicious iframes for UI redress attacks.`,
+              affectedAsset: host, attackVector: 'Iframe embedding for UI redress / clickjacking', severity: 'medium', cvss: 4.7,
+            });
+          }
+        } catch { /* ignore */ }
       }
-      // Session cookie security analysis
+      // S3: Session cookie security — ALL sessions, ALL cookies
       for (const sess of scopedSessions) {
         if (!sess.cookies) continue;
         try {
           const cookies = JSON.parse(sess.cookies) as { name: string; httpOnly?: boolean; secure?: boolean; sameSite?: string }[];
-          const insecure = cookies.filter(c => !c.secure || !c.httpOnly);
-          if (insecure.length > 0) {
-            threats.push({
-              category: 'spoofing',
-              title: `Insecure session cookies on ${sess.scope_domain}`,
-              description: `${insecure.length} cookie(s) missing Secure/HttpOnly flags: ${insecure.map(c => c.name).join(', ')}. Vulnerable to XSS theft or MITM interception.`,
-              affectedAsset: sess.scope_domain, attackVector: 'Cookie theft via XSS or network interception', severity: 'high',
-            });
-            break;
+          for (const c of cookies) {
+            const issues: string[] = [];
+            if (!c.secure) issues.push('missing Secure');
+            if (!c.httpOnly) issues.push('missing HttpOnly');
+            if (!c.sameSite || c.sameSite === 'None') issues.push('SameSite=None or unset');
+            if (issues.length > 0) {
+              pushUnique({
+                category: 'spoofing',
+                title: `Insecure cookie "${c.name}" on ${sess.scope_domain}`,
+                description: `Cookie "${c.name}" has ${issues.join(', ')}. Vulnerable to ${!c.httpOnly ? 'XSS theft' : ''}${!c.secure ? ' MITM interception' : ''}${!c.sameSite || c.sameSite === 'None' ? ' CSRF abuse' : ''}.`.replace(/  +/g, ' '),
+                affectedAsset: `${sess.scope_domain} (cookie: ${c.name})`, attackVector: 'Cookie theft/abuse via XSS, MITM, or CSRF', severity: 'high', cvss: 7.1,
+              });
+            }
           }
         } catch { /* ignore */ }
       }
-      // Auth flow failures indicate potential spoofing weaknesses
+      // S4: Auth flow failures — ALL failing flows
       for (const af of scopedAuthFlows) {
         if (af.fail_count > 0 && af.last_status === 'error') {
-          threats.push({
+          pushUnique({
             category: 'spoofing',
-            title: `Auth flow "${af.name}" has ${af.fail_count} failure(s)`,
-            description: `Unreliable authentication on ${af.scope_domain} — failed auth flows may indicate form changes, anti-automation, or auth bypass opportunities.`,
-            affectedAsset: af.scope_domain, attackVector: 'Authentication bypass via malformed/replayed auth flows', severity: 'medium',
+            title: `Auth flow "${af.name}" failing (${af.fail_count}x) on ${af.scope_domain}`,
+            description: `Auth flow has ${af.fail_count} failure(s) vs ${af.success_count} success(es). May indicate form changes, anti-automation, or exploitable auth weaknesses.`,
+            affectedAsset: af.scope_domain, attackVector: 'Auth bypass via malformed/replayed auth flows', severity: 'medium', cvss: 5.3,
           });
         }
       }
 
-      // ── T: Tampering ──
+      // ── T: Tampering — ALL state-changing endpoints, ALL anomalies ──
+
+      // T1: CSRF on ALL state-changing endpoints
       for (const ep of scopedEndpoints) {
         if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(ep.method.toUpperCase())) {
-          threats.push({
-            category: 'tampering', title: `State-changing ${ep.method} endpoint may lack CSRF protection`,
-            description: `${ep.method} ${ep.url} — verify anti-CSRF tokens or SameSite cookie enforcement.`,
-            affectedAsset: ep.url, attackVector: 'Cross-site request forgery via form/fetch from attacker-controlled page', severity: 'high',
+          pushUnique({
+            category: 'tampering', title: `CSRF risk: ${ep.method} ${ep.url}`,
+            description: `State-changing ${ep.method} ${ep.url} — verify anti-CSRF tokens, SameSite cookie, or Origin/Referer checks.`,
+            affectedAsset: ep.url, attackVector: 'Cross-site request forgery', severity: 'high', cvss: 8.0,
           });
-          break;
         }
       }
+      // T2: Stack-gap mutation anomalies — ALL findings
       for (const f of stackGapFindings) {
-        threats.push({
-          category: 'tampering', title: `Stack gap: unexpected behavior on ${f.mutation_type} mutation`,
-          description: `Endpoint ${f.endpoint} responded differently to a ${f.mutation_type} mutation (confidence: ${f.confidence}). May indicate input validation gaps.`,
+        pushUnique({
+          category: 'tampering', title: `Stack gap: ${f.mutation_type} mutation on ${f.endpoint}`,
+          description: `Endpoint ${f.endpoint} responded differently to ${f.mutation_type} mutation (confidence: ${f.confidence}). Indicates input validation gap — possible injection point.`,
           affectedAsset: f.endpoint, attackVector: `Parameter mutation: ${f.mutation_type}`,
-          severity: f.confidence === 'high' ? 'high' : 'medium',
+          severity: f.confidence === 'high' ? 'high' : 'medium', cvss: f.confidence === 'high' ? 7.5 : 5.0,
         });
       }
-      // Scan anomalies → tampering hypotheses
+      // T3: Scan anomalies — ALL status-deviation anomalies
       for (const a of scopedAnomalies) {
         if (a.status !== a.baseline_status) {
-          threats.push({
+          pushUnique({
             category: 'tampering',
-            title: `Fuzzing anomaly: payload "${a.payload.substring(0, 40)}" triggered ${a.status} (baseline ${a.baseline_status})`,
-            description: `Payload caused a different status code on ${a.target_url}. May indicate injection or input handling flaw.`,
+            title: `Fuzzing anomaly: "${a.payload.substring(0, 40)}" → ${a.status} on ${a.target_url}`,
+            description: `Payload triggered HTTP ${a.status} (baseline: ${a.baseline_status}). ${a.status >= 500 ? 'Server error suggests backend injection or crash.' : 'Status change may indicate input handling flaw.'}`,
             affectedAsset: a.target_url, attackVector: `Payload injection: ${a.payload.substring(0, 80)}`,
-            severity: a.status >= 500 ? 'high' : 'medium',
+            severity: a.status >= 500 ? 'high' : 'medium', cvss: a.status >= 500 ? 8.1 : 5.3,
           });
         }
       }
-      // Missing Content-Security-Policy → script injection
-      for (const h of scopedHistory) {
-        let respHeaders: Record<string, string> = {};
-        try { respHeaders = h.resp_headers ? JSON.parse(h.resp_headers) : {}; } catch { /* ignore */ }
-        if (!respHeaders['content-security-policy']) {
-          threats.push({
-            category: 'tampering', title: 'Missing Content-Security-Policy header',
-            description: 'No CSP header — the application may be vulnerable to XSS and script injection attacks.',
-            affectedAsset: h.url, attackVector: 'Cross-site scripting via injected scripts', severity: 'high',
-          });
-          break;
-        }
+      // T4: Missing CSP — per unique host
+      const cspHosts = new Set<string>();
+      for (const h of parsedHistory) {
+        try {
+          const host = new URL(h.url).hostname;
+          if (cspHosts.has(host)) continue;
+          if (!h.respHeaders['content-security-policy']) {
+            cspHosts.add(host);
+            pushUnique({
+              category: 'tampering', title: `Missing CSP on ${host}`,
+              description: `No Content-Security-Policy header on ${host}. Without CSP, XSS payloads execute freely — no script-src restriction.`,
+              affectedAsset: host, attackVector: 'XSS exploitation without CSP defense', severity: 'high', cvss: 7.2,
+            });
+          }
+        } catch { /* ignore */ }
       }
 
-      // ── R: Repudiation ──
-      const hasAuditEndpoint = scopedEndpoints.some(e => /audit|log|event/i.test(e.url));
+      // ── R: Repudiation — ALL evidence of missing accountability ──
+
+      // R1: No audit/logging endpoints
+      const hasAuditEndpoint = scopedEndpoints.some(e => /audit|log|event|activity/i.test(e.url));
       if (!hasAuditEndpoint && scopedEndpoints.length > 0) {
-        threats.push({
-          category: 'repudiation', title: 'No audit/logging endpoints detected',
-          description: 'No API endpoints related to audit trails were found in recon. Users may deny actions without evidence.',
-          affectedAsset: scopeDomain ?? 'all endpoints', attackVector: 'Denial of performed actions due to insufficient logging', severity: 'medium',
+        pushUnique({
+          category: 'repudiation', title: 'No audit/logging endpoints detected in recon',
+          description: `Scanned ${scopedEndpoints.length} endpoints — none match audit/log/event patterns. Without server-side logging, user actions are unattributable.`,
+          affectedAsset: scopeDomain ?? 'all endpoints', attackVector: 'Denial of actions due to no audit trail', severity: 'medium', cvss: 5.5,
         });
       }
-      // Multiple credentials per scope without MFA → repudiation risk
+      // R2: Multiple credentials per scope → shared accounts
       const credByScopeId = new Map<string, number>();
       for (const c of scopedCredentials) {
         credByScopeId.set(c.scope_id, (credByScopeId.get(c.scope_id) ?? 0) + 1);
@@ -1389,83 +1431,120 @@ async function startServer() {
       for (const [sid, count] of credByScopeId) {
         if (count > 1) {
           const domain = scopedCredentials.find(c => c.scope_id === sid)?.scope_domain;
-          threats.push({
+          pushUnique({
             category: 'repudiation',
-            title: `${count} credentials stored for ${domain ?? 'scope'} — shared accounts?`,
-            description: `Multiple credential sets for the same scope may indicate shared accounts. Without individual accountability, actions become repudiable.`,
-            affectedAsset: domain ?? sid, attackVector: 'Shared credentials undermine audit trails', severity: 'medium',
+            title: `${count} credentials for ${domain ?? sid} — shared accounts undermine accountability`,
+            description: `${count} credential sets stored for the same scope. If accounts are shared, any user can deny actions performed by another — destroying audit trail integrity.`,
+            affectedAsset: domain ?? sid, attackVector: 'Shared credentials eliminate individual attribution', severity: 'medium', cvss: 5.0,
           });
+        }
+      }
+      // R3: State-changing endpoints without response logging headers
+      const stateChangeMethods = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+      for (const h of parsedHistory) {
+        if (!stateChangeMethods.has(h.method.toUpperCase())) continue;
+        const hasRequestId = h.respHeaders['x-request-id'] || h.respHeaders['x-correlation-id'] || h.respHeaders['x-trace-id'];
+        if (!hasRequestId) {
+          try {
+            const host = new URL(h.url).hostname;
+            pushUnique({
+              category: 'repudiation',
+              title: `No request tracing on state-changing ${h.method} ${host}`,
+              description: `${h.method} ${h.url} has no X-Request-Id / X-Correlation-Id header. Without request tracing, individual mutations cannot be correlated to audit logs.`,
+              affectedAsset: host, attackVector: 'Untraceable state mutations', severity: 'low', cvss: 3.0,
+            });
+          } catch { /* ignore */ }
+          break; // One per host is enough for this check
         }
       }
 
-      // ── I: Information Disclosure ──
-      for (const h of scopedHistory) {
-        let respHeaders: Record<string, string> = {};
-        try { respHeaders = h.resp_headers ? JSON.parse(h.resp_headers) : {}; } catch { /* ignore */ }
-        const serverHeader = respHeaders['server'] || respHeaders['x-powered-by'];
-        if (serverHeader) {
-          threats.push({
-            category: 'info_disclosure', title: 'Server technology disclosed via response headers',
-            description: `Server/X-Powered-By header reveals: "${serverHeader}". Aids attacker fingerprinting.`,
-            affectedAsset: h.url, attackVector: 'Technology fingerprinting via response headers', severity: 'low',
+      // ── I: Information Disclosure — ALL leaks, not just first ──
+
+      // I1: Server/tech fingerprinting — per unique server header value
+      const seenServerHeaders = new Set<string>();
+      for (const h of parsedHistory) {
+        const serverHeader = h.respHeaders['server'] || h.respHeaders['x-powered-by'];
+        if (serverHeader && !seenServerHeaders.has(serverHeader)) {
+          seenServerHeaders.add(serverHeader);
+          pushUnique({
+            category: 'info_disclosure', title: `Server fingerprint: "${serverHeader}"`,
+            description: `Server/X-Powered-By reveals "${serverHeader}". Attackers use this to find CVEs for the specific version.`,
+            affectedAsset: h.url, attackVector: 'Technology fingerprinting → CVE lookup', severity: 'low', cvss: 2.5,
           });
-          break;
         }
       }
-      for (const h of scopedHistory) {
+      // I2: 5xx errors — ALL endpoints with server errors
+      for (const h of parsedHistory) {
         if (h.status && h.status >= 500) {
-          threats.push({
-            category: 'info_disclosure', title: 'Server error response may leak internal details',
-            description: `HTTP ${h.status} from ${h.url} — 5xx errors often contain stack traces or debug info.`,
-            affectedAsset: h.url, attackVector: 'Error-based information leakage', severity: 'medium',
+          pushUnique({
+            category: 'info_disclosure', title: `Server error ${h.status} on ${h.url}`,
+            description: `HTTP ${h.status} from ${h.method} ${h.url}. 5xx responses often contain stack traces, SQL errors, or internal paths.`,
+            affectedAsset: h.url, attackVector: 'Error-based information leakage (stack traces, debug info)', severity: 'medium', cvss: 5.3,
           });
-          break;
         }
       }
-      for (const h of scopedHistory) {
-        let respHeaders: Record<string, string> = {};
-        try { respHeaders = h.resp_headers ? JSON.parse(h.resp_headers) : {}; } catch { /* ignore */ }
-        const cors = respHeaders['access-control-allow-origin'];
+      // I3: CORS — wildcard AND reflected origin with credentials
+      for (const h of parsedHistory) {
+        const cors = h.respHeaders['access-control-allow-origin'];
+        const creds = h.respHeaders['access-control-allow-credentials'];
         if (cors === '*') {
-          threats.push({
-            category: 'info_disclosure', title: 'Wildcard CORS policy detected',
-            description: `Access-Control-Allow-Origin: * on ${h.url} — any origin can read responses.`,
-            affectedAsset: h.url, attackVector: 'Cross-origin data theft via permissive CORS', severity: 'high',
+          pushUnique({
+            category: 'info_disclosure', title: `Wildcard CORS on ${h.url}`,
+            description: `ACAO: * — any origin can read responses cross-origin.`,
+            affectedAsset: h.url, attackVector: 'Cross-origin data theft via permissive CORS', severity: 'high', cvss: 7.5,
           });
-          break;
+        } else if (cors && creds?.toLowerCase() === 'true') {
+          // Reflected origin with credentials is the actually exploitable case
+          pushUnique({
+            category: 'info_disclosure', title: `CORS reflects origin with credentials on ${h.url}`,
+            description: `ACAO reflects caller origin with ACAC: true. An attacker's site can make authenticated cross-origin requests and read responses — effectively stealing user data.`,
+            affectedAsset: h.url, attackVector: 'Authenticated cross-origin data theft (reflected origin + credentials)', severity: 'critical', cvss: 9.1,
+          });
         }
       }
-      // Scan anomalies with large response size changes → data leaks
+      // I4: Scan anomalies — ALL response inflation events
       for (const a of scopedAnomalies) {
         if (a.length > a.baseline_length * 2 && a.baseline_length > 0) {
-          threats.push({
+          pushUnique({
             category: 'info_disclosure',
-            title: `Anomalous response size (${a.length} vs baseline ${a.baseline_length})`,
-            description: `Payload "${a.payload.substring(0, 40)}" caused a ${Math.round(a.length / a.baseline_length)}x larger response on ${a.target_url}. May indicate data exfiltration or verbose error.`,
-            affectedAsset: a.target_url, attackVector: 'Input-triggered information leakage via response inflation', severity: 'medium',
+            title: `Response inflation ${Math.round(a.length / a.baseline_length)}x on ${a.target_url}`,
+            description: `Payload "${a.payload.substring(0, 40)}" caused ${a.length}B response (baseline: ${a.baseline_length}B). May indicate verbose error, directory listing, or data exfiltration.`,
+            affectedAsset: a.target_url, attackVector: 'Input-triggered information leakage via response size change', severity: 'medium', cvss: 5.3,
           });
-          break;
         }
       }
-      // Automation job findings → info disclosure
+      // I5: Automation job findings → info disclosure
       for (const job of automationJobs) {
         if (!inScope(job.target_url)) continue;
         try {
           const findings = JSON.parse(job.findings) as { type?: string; description?: string; url?: string; severity?: string }[];
           for (const f of findings) {
             if (f.type && /disclosure|leak|expos/i.test(f.type)) {
-              threats.push({
+              pushUnique({
                 category: 'info_disclosure',
-                title: `AutoHunt finding: ${f.description?.substring(0, 60) ?? f.type}`,
-                description: f.description ?? `Automation hunt detected: ${f.type}`,
+                title: `AutoHunt: ${f.description?.substring(0, 80) ?? f.type}`,
+                description: f.description ?? `Automation detected: ${f.type}`,
                 affectedAsset: f.url ?? job.target_url, attackVector: f.type, severity: f.severity ?? 'medium',
               });
             }
           }
         } catch { /* ignore */ }
       }
+      // I6: Sensitive headers leaked in responses
+      for (const h of parsedHistory) {
+        if (h.respHeaders['x-debug'] || h.respHeaders['x-debug-token'] || h.respHeaders['x-aspnet-version'] || h.respHeaders['x-aspnetmvc-version']) {
+          const debugHeader = h.respHeaders['x-debug'] || h.respHeaders['x-debug-token'] || h.respHeaders['x-aspnet-version'] || h.respHeaders['x-aspnetmvc-version'];
+          pushUnique({
+            category: 'info_disclosure', title: `Debug/version header on ${h.url}`,
+            description: `Response includes debug or version header: "${debugHeader}". Indicates a non-production configuration or framework version leak.`,
+            affectedAsset: h.url, attackVector: 'Debug header exposure', severity: 'low', cvss: 2.0,
+          });
+        }
+      }
 
-      // ── D: Denial of Service ──
+      // ── D: Denial of Service — ALL vulnerable endpoints ──
+
+      // D1: Rate limiting analysis
       const hasRateLimitHeaders = scopedHistory.some(h => {
         try {
           const rh = h.resp_headers ? JSON.parse(h.resp_headers) : {};
@@ -1473,115 +1552,187 @@ async function startServer() {
         } catch { return false; }
       });
       if (!hasRateLimitHeaders && scopedHistory.length > 0) {
-        threats.push({
-          category: 'dos', title: 'No rate-limiting headers observed',
-          description: 'None of the observed responses include rate-limit headers. Endpoints may be vulnerable to abuse.',
-          affectedAsset: scopeDomain ?? 'all endpoints', attackVector: 'Resource exhaustion via unthrottled request flooding', severity: 'medium',
+        pushUnique({
+          category: 'dos', title: 'No rate-limiting observed across all endpoints',
+          description: `Analyzed ${scopedHistory.length} responses — none include X-RateLimit-Limit, RateLimit-Limit, or Retry-After headers. Endpoints are unprotected against request flooding.`,
+          affectedAsset: scopeDomain ?? 'all endpoints', attackVector: 'Resource exhaustion via unthrottled flooding', severity: 'medium', cvss: 5.3,
         });
       }
-      // File upload or large body endpoints → DoS via resource exhaustion
+      // D2: File upload endpoints — ALL of them
       for (const ep of scopedEndpoints) {
-        if (/upload|import|file|media|image|attach/i.test(ep.url) && ep.method.toUpperCase() === 'POST') {
-          threats.push({
-            category: 'dos', title: `File upload endpoint may lack size limits: ${ep.url}`,
-            description: 'POST to upload-like endpoint — verify server-side file size and type validation.',
-            affectedAsset: ep.url, attackVector: 'Oversized file upload causing disk/memory exhaustion', severity: 'medium',
+        if (/upload|import|file|media|image|attach|document|asset/i.test(ep.url) && ep.method.toUpperCase() === 'POST') {
+          pushUnique({
+            category: 'dos', title: `Upload endpoint: ${ep.method} ${ep.url}`,
+            description: `File upload endpoint without verified server-side size/type validation. Can cause disk/memory exhaustion with oversized or crafted files (zip bombs, image bombs).`,
+            affectedAsset: ep.url, attackVector: 'Oversized/crafted file upload → resource exhaustion', severity: 'medium', cvss: 5.3,
+          });
+        }
+      }
+      // D3: Endpoints with heavy computation patterns
+      for (const ep of scopedEndpoints) {
+        if (/search|report|export|generate|render|convert|process|analyze|compile/i.test(ep.url)) {
+          pushUnique({
+            category: 'dos', title: `Compute-heavy endpoint: ${ep.method} ${ep.url}`,
+            description: `Endpoint pattern suggests CPU/memory-intensive operation. Without timeouts and rate limits, an attacker can exhaust server resources with concurrent requests.`,
+            affectedAsset: ep.url, attackVector: 'Compute exhaustion via concurrent heavy requests', severity: 'low', cvss: 3.7,
           });
         }
       }
 
-      // ── E: Elevation of Privilege ──
+      // ── E: Elevation of Privilege — ALL privileged endpoints and tokens ──
+
+      // E1: Admin/privileged endpoints — ALL of them
       for (const ep of scopedEndpoints) {
-        if (/admin|manage|role|permission|user.*create|user.*delete|sudo|superuser|grant/i.test(ep.url)) {
-          threats.push({
-            category: 'elevation', title: 'Privileged endpoint detected — verify authorization',
-            description: `${ep.method} ${ep.url} appears to be an admin/privileged endpoint. Ensure proper role checks.`,
-            affectedAsset: ep.url, attackVector: 'IDOR or missing authorization checks on privileged operations', severity: 'critical',
+        if (/admin|manage|role|permission|user.*create|user.*delete|sudo|superuser|grant|rbac|acl/i.test(ep.url)) {
+          pushUnique({
+            category: 'elevation', title: `Privileged endpoint: ${ep.method} ${ep.url}`,
+            description: `Admin/privileged endpoint detected. Test for: missing auth checks, IDOR via user ID manipulation, role parameter tampering, direct object reference to other users' resources.`,
+            affectedAsset: ep.url, attackVector: 'IDOR / missing authorization on privileged operations', severity: 'critical', cvss: 9.1,
           });
         }
       }
-      for (const h of scopedHistory) {
-        let reqHeaders: Record<string, string> = {};
-        try { reqHeaders = h.headers ? JSON.parse(h.headers) : {}; } catch { /* ignore */ }
-        if (reqHeaders['authorization']?.toLowerCase().startsWith('bearer ')) {
-          threats.push({
-            category: 'elevation', title: 'JWT/Bearer token detected — verify token validation',
-            description: 'Bearer tokens may be vulnerable to algorithm confusion, weak signing, or missing expiry checks.',
-            affectedAsset: h.url, attackVector: 'JWT manipulation: none algorithm, key confusion, expired token reuse', severity: 'high',
+      // E2: JWT/Bearer tokens — ALL endpoints using them
+      const jwtEndpoints = new Set<string>();
+      for (const h of parsedHistory) {
+        const authHeader = h.reqHeaders['authorization']?.toLowerCase() ?? '';
+        if (authHeader.startsWith('bearer ') && !jwtEndpoints.has(h.url)) {
+          jwtEndpoints.add(h.url);
+          // Try to detect JWT structure (3 base64 segments)
+          const token = h.reqHeaders['authorization']?.substring(7) ?? '';
+          const isJwt = token.split('.').length === 3;
+          pushUnique({
+            category: 'elevation', title: `${isJwt ? 'JWT' : 'Bearer'} token on ${h.url}`,
+            description: `${isJwt ? 'JWT token detected — test for: alg:none bypass, RS256→HS256 confusion, expired token reuse, missing audience/issuer validation, weak HMAC secret.' : 'Bearer token used — verify token cannot be forged, replayed, or reused after revocation.'}`,
+            affectedAsset: h.url, attackVector: isJwt ? 'JWT manipulation (alg:none, key confusion, expiry bypass)' : 'Bearer token forgery/replay', severity: 'high', cvss: 8.0,
           });
-          break;
         }
       }
-      // Automation job findings → elevation
+      // E3: Automation job findings → elevation
       for (const job of automationJobs) {
         if (!inScope(job.target_url)) continue;
         try {
           const findings = JSON.parse(job.findings) as { type?: string; description?: string; url?: string; severity?: string }[];
           for (const f of findings) {
-            if (f.type && /idor|priv|auth.*bypass|escalat/i.test(f.type)) {
-              threats.push({
+            if (f.type && /idor|priv|auth.*bypass|escalat|role/i.test(f.type)) {
+              pushUnique({
                 category: 'elevation',
-                title: `AutoHunt finding: ${f.description?.substring(0, 60) ?? f.type}`,
-                description: f.description ?? `Automation hunt detected: ${f.type}`,
+                title: `AutoHunt: ${f.description?.substring(0, 80) ?? f.type}`,
+                description: f.description ?? `Automation detected: ${f.type}`,
                 affectedAsset: f.url ?? job.target_url, attackVector: f.type, severity: f.severity ?? 'high',
               });
             }
           }
         } catch { /* ignore */ }
       }
-      // Session without scope-bound auth flow → elevation risk
+      // E4: Sessions without auth flows — potential session fixation
       for (const sess of scopedSessions) {
         const hasFlow = scopedAuthFlows.some(af => af.scope_id === sess.scope_id);
         if (!hasFlow) {
-          threats.push({
+          pushUnique({
             category: 'elevation',
-            title: `Session on ${sess.scope_domain} has no bound auth flow`,
-            description: 'Captured session has no automated auth-flow macro — if the session expires, manual re-auth is needed. Consider whether session fixation or reuse attacks apply.',
-            affectedAsset: sess.scope_domain, attackVector: 'Session fixation or stale session reuse', severity: 'low',
+            title: `Unbound session on ${sess.scope_domain}`,
+            description: `Session captured without automated auth-flow. If session tokens are not rotated on login, session fixation attacks may be possible. Also test for horizontal privilege escalation by swapping session tokens between users.`,
+            affectedAsset: sess.scope_domain, attackVector: 'Session fixation / horizontal privilege escalation via token swap', severity: 'medium', cvss: 5.4,
           });
-          break;
+        }
+      }
+      // E5: API endpoints that accept ID parameters — IDOR candidates
+      for (const ep of scopedEndpoints) {
+        if (/\/\d+$|\/[a-f0-9-]{36}$|\/:id|\/\{id\}|user_id|account_id|profile/i.test(ep.url)) {
+          pushUnique({
+            category: 'elevation', title: `IDOR candidate: ${ep.method} ${ep.url}`,
+            description: `Endpoint accepts identifiers in URL path. Test by substituting other users' IDs to check for horizontal/vertical privilege escalation.`,
+            affectedAsset: ep.url, attackVector: 'IDOR — access other users\' resources by ID manipulation', severity: 'high', cvss: 7.5,
+          });
         }
       }
 
-      // Persist generated threats
-      stridePersist(threats, scopeId ?? null);
+      // Persist generated threats (deduplicates against existing DB entries)
+      const inserted = stridePersist(threats, scopeId ?? null);
 
-      res.json({ generated: threats.length, threats });
+      res.json({ generated: threats.length, newlyInserted: inserted, threats });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
   });
 
-  // STRIDE: generate threats from a single proxy response (called inline by lab/proxy).
-  // Lightweight — only checks headers on a single response.
+  // STRIDE: real-time per-response analysis — runs on every proxy call.
+  // Comprehensive: checks 10+ security indicators per response.
   function strideAnalyzeSingleResponse(
     url: string, method: string,
     reqHeaders: Record<string, string>, respHeaders: Record<string, string>,
     status: number, scopeId: string | null,
   ) {
     const threats: StrideHypothesis[] = [];
+    const lowerRespHeaders: Record<string, string> = {};
+    for (const [k, v] of Object.entries(respHeaders)) lowerRespHeaders[k.toLowerCase()] = v;
     const hasAuth = reqHeaders['authorization'] || reqHeaders['cookie'];
-    if (hasAuth && !respHeaders['strict-transport-security']) {
+
+    // S: Spoofing
+    if (hasAuth && !lowerRespHeaders['strict-transport-security']) {
       threats.push({
-        category: 'spoofing', title: 'Missing HSTS on authenticated endpoint',
-        description: `${method} ${url} — authenticated request without HSTS.`,
-        affectedAsset: url, attackVector: 'SSL stripping / MITM', severity: 'high',
+        category: 'spoofing', title: `Missing HSTS on authenticated endpoint: ${url}`,
+        description: `${method} ${url} — auth material sent without HSTS. SSL stripping possible.`,
+        affectedAsset: url, attackVector: 'SSL stripping / MITM', severity: 'high', cvss: 7.4,
       });
     }
-    if (respHeaders['access-control-allow-origin'] === '*') {
+    if (!lowerRespHeaders['x-frame-options'] && !lowerRespHeaders['content-security-policy']?.includes('frame-ancestors')) {
       threats.push({
-        category: 'info_disclosure', title: 'Wildcard CORS on this endpoint',
-        description: `Access-Control-Allow-Origin: * on ${url}`,
-        affectedAsset: url, attackVector: 'Cross-origin data theft', severity: 'high',
+        category: 'spoofing', title: `No clickjacking protection: ${url}`,
+        description: `No X-Frame-Options or CSP frame-ancestors. Page can be iframed for clickjacking.`,
+        affectedAsset: url, attackVector: 'Clickjacking via iframe embedding', severity: 'medium', cvss: 4.7,
+      });
+    }
+
+    // T: Tampering
+    if (!lowerRespHeaders['content-security-policy']) {
+      threats.push({
+        category: 'tampering', title: `Missing CSP: ${url}`,
+        description: `No Content-Security-Policy — XSS payloads execute unrestricted.`,
+        affectedAsset: url, attackVector: 'XSS without CSP mitigation', severity: 'high', cvss: 7.2,
+      });
+    }
+
+    // I: Information Disclosure
+    const cors = lowerRespHeaders['access-control-allow-origin'];
+    const creds = lowerRespHeaders['access-control-allow-credentials'];
+    if (cors === '*') {
+      threats.push({
+        category: 'info_disclosure', title: `Wildcard CORS: ${url}`,
+        description: `ACAO: * — any origin reads responses.`,
+        affectedAsset: url, attackVector: 'Cross-origin data theft', severity: 'high', cvss: 7.5,
+      });
+    } else if (cors && creds?.toLowerCase() === 'true') {
+      threats.push({
+        category: 'info_disclosure', title: `CORS reflects origin + credentials: ${url}`,
+        description: `ACAO reflects caller with ACAC:true — attacker site can steal authenticated data.`,
+        affectedAsset: url, attackVector: 'Authenticated cross-origin theft', severity: 'critical', cvss: 9.1,
       });
     }
     if (status >= 500) {
       threats.push({
-        category: 'info_disclosure', title: `Server error ${status} may leak details`,
-        description: `HTTP ${status} from ${method} ${url}`,
-        affectedAsset: url, attackVector: 'Error-based leakage', severity: 'medium',
+        category: 'info_disclosure', title: `Server error ${status}: ${url}`,
+        description: `HTTP ${status} from ${method} ${url} — may leak stack traces or internal paths.`,
+        affectedAsset: url, attackVector: 'Error-based info leakage', severity: 'medium', cvss: 5.3,
       });
     }
+    const serverHeader = lowerRespHeaders['server'] || lowerRespHeaders['x-powered-by'];
+    if (serverHeader) {
+      threats.push({
+        category: 'info_disclosure', title: `Server fingerprint "${serverHeader}": ${url}`,
+        description: `Reveals server technology for CVE lookup.`,
+        affectedAsset: url, attackVector: 'Technology fingerprinting', severity: 'low', cvss: 2.5,
+      });
+    }
+    const debugHeader = lowerRespHeaders['x-debug'] || lowerRespHeaders['x-debug-token'] || lowerRespHeaders['x-aspnet-version'];
+    if (debugHeader) {
+      threats.push({
+        category: 'info_disclosure', title: `Debug header on ${url}: "${debugHeader}"`,
+        description: `Non-production header exposed — indicates debug mode or framework version leak.`,
+        affectedAsset: url, attackVector: 'Debug header exposure', severity: 'low', cvss: 2.0,
+      });
+    }
+
     if (threats.length > 0) stridePersist(threats, scopeId);
     return threats.length;
   }
@@ -1600,21 +1751,32 @@ async function startServer() {
 
       const threats: StrideHypothesis[] = [];
       for (const a of anomalies) {
+        // T: Status deviation → injection / input handling flaw
         if (a.status !== scan.baseline_status) {
           threats.push({
             category: 'tampering',
-            title: `Scan anomaly: "${a.payload.substring(0, 40)}" → HTTP ${a.status}`,
-            description: `Payload caused status ${a.status} (baseline ${scan.baseline_status}) on ${scan.target_url}.`,
+            title: `Scan anomaly: "${a.payload.substring(0, 40)}" → ${a.status} on ${scan.target_url}`,
+            description: `Payload triggered HTTP ${a.status} (baseline: ${scan.baseline_status}). ${a.status >= 500 ? 'Server error — possible injection point.' : 'Status change indicates input processing flaw.'}`,
             affectedAsset: scan.target_url, attackVector: `Fuzzing payload: ${a.payload.substring(0, 80)}`,
-            severity: a.status >= 500 ? 'high' : 'medium',
+            severity: a.status >= 500 ? 'high' : 'medium', cvss: a.status >= 500 ? 8.1 : 5.3,
           });
         }
+        // I: Response inflation → data leak or verbose error
         if (a.length > scan.baseline_length * 2 && scan.baseline_length > 0) {
           threats.push({
             category: 'info_disclosure',
-            title: `Scan anomaly: ${a.length}B response (${Math.round(a.length / scan.baseline_length)}x baseline)`,
-            description: `Payload "${a.payload.substring(0, 40)}" inflated response on ${scan.target_url}.`,
-            affectedAsset: scan.target_url, attackVector: 'Response inflation via crafted input', severity: 'medium',
+            title: `Response inflation ${Math.round(a.length / scan.baseline_length)}x: "${a.payload.substring(0, 40)}" on ${scan.target_url}`,
+            description: `${a.length}B response vs ${scan.baseline_length}B baseline. May indicate verbose error, directory listing, or data exfiltration.`,
+            affectedAsset: scan.target_url, attackVector: 'Input-triggered info leakage via response size', severity: 'medium', cvss: 5.3,
+          });
+        }
+        // D: Timeout or extreme response → DoS indicator
+        if (a.length > scan.baseline_length * 10 && scan.baseline_length > 0) {
+          threats.push({
+            category: 'dos',
+            title: `Extreme response inflation ${Math.round(a.length / scan.baseline_length)}x on ${scan.target_url}`,
+            description: `Payload "${a.payload.substring(0, 40)}" caused ${a.length}B response (${Math.round(a.length / scan.baseline_length)}x baseline). May enable resource exhaustion attacks.`,
+            affectedAsset: scan.target_url, attackVector: 'Response amplification via crafted input', severity: 'high', cvss: 7.5,
           });
         }
       }
@@ -1628,8 +1790,8 @@ async function startServer() {
         if (match) scopeId = match.id;
       } catch { /* ignore */ }
 
-      stridePersist(threats, scopeId);
-      res.json({ generated: threats.length, threats });
+      const inserted = stridePersist(threats, scopeId);
+      res.json({ generated: threats.length, newlyInserted: inserted, threats });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
@@ -1936,7 +2098,7 @@ async function startServer() {
 
         db.prepare('UPDATE scans SET status = ? WHERE id = ?').run('completed', scanId);
 
-        // Auto-generate STRIDE threats from scan anomalies
+        // Auto-generate STRIDE threats from scan anomalies (multi-category)
         try {
           const anomalies = db.prepare('SELECT * FROM scan_results WHERE scan_id = ? AND is_anomaly = 1').all(scanId) as { payload: string; status: number; length: number }[];
           if (anomalies.length > 0) {
@@ -1948,14 +2110,30 @@ async function startServer() {
               if (match) scanScopeId = match.id;
             } catch { /* ignore */ }
             const scanThreats: StrideHypothesis[] = [];
-            for (const a of anomalies.slice(0, 20)) {
+            for (const a of anomalies.slice(0, 30)) {
               if (a.status !== baselineStatus) {
                 scanThreats.push({
                   category: 'tampering',
-                  title: `Scan anomaly: "${a.payload.substring(0, 40)}" → HTTP ${a.status}`,
-                  description: `Payload caused status ${a.status} (baseline ${baselineStatus}) on ${targetUrl}.`,
+                  title: `Scan anomaly: "${a.payload.substring(0, 40)}" → ${a.status} on ${targetUrl}`,
+                  description: `Payload triggered ${a.status} (baseline: ${baselineStatus}). ${a.status >= 500 ? 'Server error — possible injection.' : 'Status change — input handling flaw.'}`,
                   affectedAsset: targetUrl, attackVector: `Fuzzing payload: ${a.payload.substring(0, 80)}`,
-                  severity: a.status >= 500 ? 'high' : 'medium',
+                  severity: a.status >= 500 ? 'high' : 'medium', cvss: a.status >= 500 ? 8.1 : 5.3,
+                });
+              }
+              if (baselineLength > 0 && a.length > baselineLength * 2) {
+                scanThreats.push({
+                  category: 'info_disclosure',
+                  title: `Response inflation ${Math.round(a.length / baselineLength)}x: "${a.payload.substring(0, 40)}" on ${targetUrl}`,
+                  description: `${a.length}B vs ${baselineLength}B baseline. Possible verbose error or data leak.`,
+                  affectedAsset: targetUrl, attackVector: 'Response inflation via crafted input', severity: 'medium', cvss: 5.3,
+                });
+              }
+              if (baselineLength > 0 && a.length > baselineLength * 10) {
+                scanThreats.push({
+                  category: 'dos',
+                  title: `Extreme inflation ${Math.round(a.length / baselineLength)}x on ${targetUrl}`,
+                  description: `Payload "${a.payload.substring(0, 40)}" caused ${a.length}B response. Amplification attack possible.`,
+                  affectedAsset: targetUrl, attackVector: 'Response amplification', severity: 'high', cvss: 7.5,
                 });
               }
             }
@@ -2168,7 +2346,7 @@ async function startServer() {
     res.json(logs.map((l: any) => ({ ...l, data: l.data ? JSON.parse(l.data) : null })));
   });
 
-  // --- AI Proxy Endpoints (Ollama — local, free, no API key) ---
+  // --- AI Proxy Endpoints (Cloudflare Workers AI / Remote Ollama) ---
   app.post('/api/ai/generate-payloads', async (req, res) => {
     const { name, type } = req.body;
     if (!name) return res.status(400).json({ error: 'name is required' });
@@ -2178,8 +2356,13 @@ async function startServer() {
     if (content) {
       res.json({ content });
     } else {
-      res.status(500).json({ error: 'Ollama is not reachable. Make sure Ollama is running (ollama serve).' });
+      res.status(500).json({ error: `AI backend not reachable. ${OllamaClient.getBackendName()}` });
     }
+  });
+
+  app.get('/api/ai/status', async (_req, res) => {
+    const available = await OllamaClient.isAvailable();
+    res.json({ available, backend: OllamaClient.getBackendName() });
   });
 
   app.post('/api/ai/analyze-response', async (req, res) => {
@@ -2192,7 +2375,7 @@ async function startServer() {
       if (analysis) {
         res.json({ analysis });
       } else {
-        res.status(500).json({ error: 'Ollama is not reachable. Make sure Ollama is running (ollama serve).' });
+        res.status(500).json({ error: `AI backend not reachable. ${OllamaClient.getBackendName()}` });
       }
     } catch (err: any) {
       res.status(500).json({ error: err.message });
