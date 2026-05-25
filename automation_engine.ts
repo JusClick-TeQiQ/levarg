@@ -811,127 +811,163 @@ export class AutomationEngine {
         this.updateJob(jobId, 'running', 'Phase 3: Discovery');
         this.log(jobId, 'info', 'Starting Phase 3: Active Enumeration & Content Discovery');
 
-        const browser = await puppeteer.launch({ 
-          headless: true, 
-          executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome',
-          args: [
-            '--no-sandbox', 
-            '--disable-setuid-sandbox',
-            '--disable-blink-features=AutomationControlled'
-          ] 
-        }).catch(async () => {
-          // Fallback to default if /usr/bin/google-chrome doesn't exist
-          return await puppeteer.launch({
-            headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox']
-          });
-        });
-        
+        let browserAvailable = true;
+        let browser: Awaited<ReturnType<typeof puppeteer.launch>> | null = null;
         try {
-          for (const asset of discoveredAssets.slice(0, 10)) { // Increased depth
-            this.log(jobId, 'info', `Crawling ${asset}...`);
-            const page = await browser.newPage();
-            await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36');
-            
-            try {
-              const response = await page.goto(asset, { waitUntil: 'networkidle2', timeout: 30000 });
-              if (!response) continue;
+          browser = await puppeteer.launch({
+            headless: true,
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome',
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled'],
+          });
+        } catch {
+          try {
+            browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+          } catch {
+            browserAvailable = false;
+            this.log(jobId, 'warn', 'Browser not available — falling back to HTTP-only crawling (install Chrome for full crawling).');
+          }
+        }
 
-              // 1. DOM Link Extraction
-              const domEndpoints = await page.evaluate(() => {
-                try {
-                  const links = Array.from(document.querySelectorAll('a')).map(a => ({ url: a.href, method: 'GET' }));
-                  const forms = Array.from(document.querySelectorAll('form')).map(f => ({
-                    url: new URL(f.action || window.location.href, window.location.origin).href,
-                    method: (f.method || 'GET').toUpperCase()
-                  }));
-                  const scripts = Array.from(document.querySelectorAll('script')).map(s => s.src).filter(src => src);
-                  return { links, forms, scripts };
-                } catch (e) {
-                  return { links: [], forms: [], scripts: [] };
-                }
-              }).catch(() => ({ links: [], forms: [], scripts: [] }));
-              
-              endpoints.push(...domEndpoints.links, ...domEndpoints.forms);
+        if (browser) {
+          try {
+            for (const asset of discoveredAssets.slice(0, 10)) {
+              this.log(jobId, 'info', `Crawling ${asset}...`);
+              const page = await browser.newPage();
+              await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36');
 
-              // 2. JS Secret Mining & Endpoint Extraction
-              for (const scriptUrl of domEndpoints.scripts) {
-                try {
-                  const jsRes = await axios.get(scriptUrl, { timeout: 5000, validateStatus: () => true });
-                  if (jsRes.status === 200 && typeof jsRes.data === 'string') {
-                    const jsContent = jsRes.data;
-                    
-                    // Extract hidden endpoints from JS
-                    const hiddenPaths = jsContent.match(/(?:"|')(\/[a-zA-Z0-9\/\._\-\?\&]+)(?:"|')/g) || [];
-                    hiddenPaths.forEach(p => {
-                      const path = p.replace(/["']/g, '');
-                      if (path.length > 2) endpoints.push({ url: new URL(path, asset).href, method: 'GET' });
-                    });
+              try {
+                const response = await page.goto(asset, { waitUntil: 'networkidle2', timeout: 30000 });
+                if (!response) continue;
 
-                    // Search for secrets in JS
-                    if (ai) {
-                      const secretPrompt = `Analyze this JavaScript file content for hardcoded secrets, API keys, or sensitive internal endpoints.
-                      URL: ${scriptUrl}
-                      Content Snippet: ${jsContent.substring(0, 5000)}
-                      
-                      Return JSON: { "found": boolean, "secrets": string[], "explanation": string }`;
-                      
-                      const secretText = await ai.generate(secretPrompt, true);
-                      
-                      if (secretText) {
-                        const analysis = JSON.parse(secretText);
-                        if (analysis.found) {
-                          this.log(jobId, 'vuln', `SECRET DISCOVERED IN JS: ${scriptUrl}`, { secrets: analysis.secrets, explanation: analysis.explanation });
-                          MemoryManager.addFinding(jobId, hostname, { type: 'Hardcoded Secret', asset: scriptUrl, gap: 'Sensitive data in client-side JS', details: analysis.explanation });
+                const domEndpoints = await page.evaluate(() => {
+                  try {
+                    const links = Array.from(document.querySelectorAll('a')).map(a => ({ url: a.href, method: 'GET' }));
+                    const forms = Array.from(document.querySelectorAll('form')).map(f => ({
+                      url: new URL(f.action || window.location.href, window.location.origin).href,
+                      method: (f.method || 'GET').toUpperCase()
+                    }));
+                    const scripts = Array.from(document.querySelectorAll('script')).map(s => s.src).filter(src => src);
+                    return { links, forms, scripts };
+                  } catch (e) {
+                    return { links: [], forms: [], scripts: [] };
+                  }
+                }).catch(() => ({ links: [], forms: [], scripts: [] }));
+
+                endpoints.push(...domEndpoints.links, ...domEndpoints.forms);
+
+                for (const scriptUrl of domEndpoints.scripts) {
+                  try {
+                    const jsRes = await axios.get(scriptUrl, { timeout: 5000, validateStatus: () => true });
+                    if (jsRes.status === 200 && typeof jsRes.data === 'string') {
+                      const jsContent = jsRes.data;
+                      const hiddenPaths = jsContent.match(/(?:"|')(\/[a-zA-Z0-9\/\._\-\?\&]+)(?:"|')/g) || [];
+                      hiddenPaths.forEach(p => {
+                        const path = p.replace(/["']/g, '');
+                        if (path.length > 2) endpoints.push({ url: new URL(path, asset).href, method: 'GET' });
+                      });
+
+                      if (ai) {
+                        const secretPrompt = `Analyze this JavaScript file content for hardcoded secrets, API keys, or sensitive internal endpoints.
+                        URL: ${scriptUrl}
+                        Content Snippet: ${jsContent.substring(0, 5000)}
+                        
+                        Return JSON: { "found": boolean, "secrets": string[], "explanation": string }`;
+
+                        const secretText = await ai.generate(secretPrompt, true);
+                        if (secretText) {
+                          try {
+                            const analysis = JSON.parse(secretText);
+                            if (analysis.found) {
+                              this.log(jobId, 'vuln', `SECRET DISCOVERED IN JS: ${scriptUrl}`, { secrets: analysis.secrets, explanation: analysis.explanation });
+                              MemoryManager.addFinding(jobId, hostname, { type: 'Hardcoded Secret', asset: scriptUrl, gap: 'Sensitive data in client-side JS', details: analysis.explanation });
+                            }
+                          } catch { /* AI returned non-JSON */ }
                         }
                       }
                     }
+                  } catch (e) {}
+                }
+
+                const bodyContent = await page.content().catch(() => '');
+                const regexLinks = bodyContent.match(/(?:"|')(\/[a-zA-Z0-9\/\._\-\?\&]+)(?:"|')/g) || [];
+                const parsedRegexLinks = regexLinks.map(l => {
+                  const path = l.replace(/["']/g, '');
+                  try { return { url: new URL(path, asset).href, method: 'GET' }; }
+                  catch(e) { return null; }
+                }).filter(l => l !== null) as {url: string, method: string}[];
+                endpoints.push(...parsedRegexLinks);
+
+                try {
+                  const robotsRes = await axios.get(`${new URL(asset).origin}/robots.txt`, { timeout: 5000, validateStatus: () => true });
+                  if (robotsRes.status === 200 && typeof robotsRes.data === 'string') {
+                    const disallowed = robotsRes.data.match(/Disallow: (.*)/g) || [];
+                    disallowed.forEach(line => {
+                      const path = line.split(': ')[1]?.trim();
+                      if (path) { try { endpoints.push({ url: new URL(path, asset).href, method: 'GET' }); } catch (e) {} }
+                    });
                   }
                 } catch (e) {}
-              }
-              
-              // 3. Regex-based Link Extraction (for JS/Source)
-              const bodyContent = await page.content().catch(() => '');
-              const regexLinks = bodyContent.match(/(?:"|')(\/[a-zA-Z0-9\/\._\-\?\&]+)(?:"|')/g) || [];
-              const parsedRegexLinks = regexLinks.map(l => {
-                const path = l.replace(/["']/g, '');
-                try {
-                  return { url: new URL(path, asset).href, method: 'GET' };
-                } catch(e) { return null; }
-              }).filter(l => l !== null) as {url: string, method: string}[];
 
-              endpoints.push(...parsedRegexLinks);
-              
-              // 3. Robots.txt Parsing
+              } catch (e: any) {
+                if (e.message?.includes('Execution context was destroyed')) {
+                  this.log(jobId, 'warn', `Crawling ${asset} interrupted by navigation. Skipping...`);
+                } else {
+                  this.log(jobId, 'warn', `Failed to crawl ${asset}: ${e instanceof Error ? e.message : String(e)}`);
+                }
+              } finally {
+                if (!page.isClosed()) await page.close().catch(() => {});
+              }
+            }
+          } finally {
+            await browser.close();
+          }
+        } else {
+          // HTTP-only fallback: fetch HTML, parse links/forms/scripts without a browser
+          this.log(jobId, 'info', 'HTTP-only crawl mode: extracting links via HTML parsing');
+          for (const asset of discoveredAssets.slice(0, 10)) {
+            try {
+              this.log(jobId, 'info', `Crawling ${asset} (HTTP)...`);
+              const res = await axios.get(asset, { timeout: 10000, validateStatus: () => true, maxRedirects: 3 });
+              if (typeof res.data !== 'string') continue;
+              const $ = cheerio.load(res.data);
+              $('a[href]').each((_i, el) => {
+                const href = $(el).attr('href');
+                if (href) { try { endpoints.push({ url: new URL(href, asset).href, method: 'GET' }); } catch {} }
+              });
+              $('form').each((_i, el) => {
+                const action = $(el).attr('action') || asset;
+                const method = ($(el).attr('method') || 'GET').toUpperCase();
+                try { endpoints.push({ url: new URL(action, asset).href, method }); } catch {}
+              });
+              $('script[src]').each((_i, el) => {
+                const src = $(el).attr('src');
+                if (src) {
+                  try {
+                    const scriptUrl = new URL(src, asset).href;
+                    endpoints.push({ url: scriptUrl, method: 'GET' });
+                  } catch {}
+                }
+              });
+              // Regex extraction from page source
+              const regexLinks = res.data.match(/(?:"|')(\/[a-zA-Z0-9\/\._\-\?\&]+)(?:"|')/g) || [];
+              regexLinks.forEach((l: string) => {
+                const path = l.replace(/["']/g, '');
+                if (path.length > 2) { try { endpoints.push({ url: new URL(path, asset).href, method: 'GET' }); } catch {} }
+              });
+              // robots.txt
               try {
                 const robotsRes = await axios.get(`${new URL(asset).origin}/robots.txt`, { timeout: 5000, validateStatus: () => true });
                 if (robotsRes.status === 200 && typeof robotsRes.data === 'string') {
-                  const disallowed = robotsRes.data.match(/Disallow: (.*)/g) || [];
-                  disallowed.forEach(line => {
+                  (robotsRes.data.match(/Disallow: (.*)/g) || []).forEach((line: string) => {
                     const path = line.split(': ')[1]?.trim();
-                    if (path) {
-                      try {
-                        endpoints.push({ url: new URL(path, asset).href, method: 'GET' });
-                      } catch (e) {}
-                    }
+                    if (path) { try { endpoints.push({ url: new URL(path, asset).href, method: 'GET' }); } catch {} }
                   });
                 }
-              } catch (e) {}
-
-            } catch (e: any) {
-              if (e.message.includes('Execution context was destroyed')) {
-                this.log(jobId, 'warn', `Crawling ${asset} interrupted by navigation. Skipping...`);
-              } else {
-                this.log(jobId, 'warn', `Failed to crawl ${asset}: ${e instanceof Error ? e.message : String(e)}`);
-              }
-            } finally {
-              if (!page.isClosed()) {
-                await page.close().catch(() => {});
-              }
+              } catch {}
+            } catch (e) {
+              this.log(jobId, 'warn', `HTTP crawl failed for ${asset}: ${e instanceof Error ? e.message : String(e)}`);
             }
           }
-        } finally {
-          await browser.close();
         }
 
         // Directory Brute-forcing across ALL assets (SecLists-backed, parallel batches)

@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
+    "setup": "node -e \"const fs=require('fs'); if(!fs.existsSync('.env')){fs.copyFileSync('.env.example','.env');console.log('Created .env from .env.example — edit it with your CF_AI_TOKEN and CF_ACCOUNT_ID')}else{console.log('.env already exists')}\"",
+    "postinstall": "npm run setup 2>/dev/null || true",
     "build": "esbuild server_mobile.ts --bundle --platform=node --packages=external --format=esm --outfile=static/nodejs/server.js && vite build",
     "build:web": "vite build && esbuild server.ts --bundle --platform=node --packages=external --format=esm --outfile=dist/server.js",
     "start": "NODE_ENV=production node dist/server.js",
