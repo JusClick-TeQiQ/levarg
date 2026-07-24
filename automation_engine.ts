@@ -3532,11 +3532,11 @@ Return JSON: {
 
         // 4i-6: Cloud metadata exploitation
         this.log(jobId, 'info', 'Phase 4i-6: Cloud metadata exploitation');
-        const ssrfEndpoints = endpoints.filter((ep: { url: string }) =>
+        const ssrfEndpointsForCloud = endpoints.filter((ep: { url: string }) =>
           ssrfParamPatterns.some(p => ep.url.toLowerCase().includes(`${p}=`))
         );
 
-        for (const ep of ssrfEndpoints.slice(0, 3)) {
+        for (const ep of ssrfEndpointsForCloud.slice(0, 3)) {
           try {
             const cloudFindings = await ObfuscationEngine.testCloudMetadata(ep.url);
             
@@ -3557,7 +3557,7 @@ Return JSON: {
             }
           } catch {}
         }
-        this.log(jobId, 'info', `Phase 4i-6 complete: ${ssrfEndpoints.length} SSRF endpoints tested for cloud metadata`);
+        this.log(jobId, 'info', `Phase 4i-6 complete: ${ssrfEndpointsForCloud.length} SSRF endpoints tested for cloud metadata`);
 
         // 4i-7: Container escape detection
         this.log(jobId, 'info', 'Phase 4i-7: Container escape detection');
