@@ -32,12 +32,12 @@ export class StackGapAnalyzer {
       const poweredBy = String(headers['x-powered-by'] ?? '').toLowerCase();
       const via = String(headers['via'] ?? '').toLowerCase();
 
-      // CDN / WAF / Auth
-      if (headers['cf-ray'] || serverHeader.includes('cloudflare')) { cdn = 'Cloudflare'; waf = 'Cloudflare WAF'; }
+      // CDN / Web Filter / Auth
+      if (headers['cf-ray'] || serverHeader.includes('cloudflare')) { cdn = 'Cloudflare'; waf = 'Cloudflare Filter'; }
       else if (headers['x-amz-cf-id'] || via.includes('cloudfront')) cdn = 'AWS CloudFront';
       else if (headers['fastly-client-ip'] || headers['x-fastly-request-id']) cdn = 'Fastly';
       else if (headers['x-akamai-request-id'] || serverHeader.includes('akamai')) cdn = 'Akamai';
-      else if (serverHeader.includes('sucuri')) { cdn = 'Sucuri'; waf = 'Sucuri WAF'; }
+      else if (serverHeader.includes('sucuri')) { cdn = 'Sucuri'; waf = 'Sucuri Filter'; }
       else if (serverHeader.includes('imperva') || headers['x-iinfo']) waf = 'Imperva Incapsula';
 
       // Auth Stack Detection

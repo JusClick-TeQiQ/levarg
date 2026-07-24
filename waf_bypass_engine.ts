@@ -1,12 +1,12 @@
 /**
- * waf_bypass_engine — Dedicated WAF detection, fingerprinting, and bypass module.
+ * waf_bypass_engine — Dedicated web filtering detection, fingerprinting, and testing module.
  *
  * Extracted from the automation engine's phase 4g to provide:
- *   1. Standalone WAF fingerprinting with a richer signature database
+ *   1. Standalone web filtering fingerprinting with a richer signature database
  *   2. Multi-layer encoding chains (not just single transforms)
- *   3. Per-WAF bypass playbooks tuned to vendor-specific weaknesses
- *   4. Protocol-level bypass techniques (HTTP/2, chunked TE, header injection)
- *   5. API endpoint for on-demand WAF analysis outside of full hunts
+ *   3. Per-vendor testing playbooks tuned to vendor-specific characteristics
+ *   4. Protocol-level testing techniques (HTTP/2, chunked TE, header injection)
+ *   5. API endpoint for on-demand web filtering analysis outside of full hunts
  */
 
 import axios from 'axios';
@@ -61,7 +61,7 @@ export interface BypassResult {
 // WAF Signature Database — extended set with cookie and CDN indicators
 // ---------------------------------------------------------------------------
 
-const WAF_SIGNATURES: WafSignature[] = [
+const WEB_FILTER_SIGNATURES: WafSignature[] = [
   {
     name: 'Cloudflare',
     vendor: 'Cloudflare',
@@ -343,7 +343,7 @@ export class WafBypassEngine {
           : res.headers['set-cookie'] ? [res.headers['set-cookie']] : [];
         const cookieStr = setCookies.join('; ');
 
-        for (const sig of WAF_SIGNATURES) {
+        for (const sig of WEB_FILTER_SIGNATURES) {
           const matches: string[] = [];
 
           for (const [header, pattern] of Object.entries(sig.headers)) {
@@ -372,7 +372,7 @@ export class WafBypassEngine {
 
     for (const [name, evidence] of Object.entries(evidenceMap)) {
       const unique = [...new Set(evidence)];
-      const sig = WAF_SIGNATURES.find(s => s.name === name);
+      const sig = WEB_FILTER_SIGNATURES.find(s => s.name === name);
       detections.push({
         name,
         vendor: sig?.vendor ?? 'Unknown',
@@ -496,8 +496,8 @@ export class WafBypassEngine {
     }));
   }
 
-  /** Return the full WAF signature list for UI display. */
+  /** Return the full web filter signature list for UI display. */
   static getSignatures(): Array<{ name: string; vendor: string }> {
-    return WAF_SIGNATURES.map(s => ({ name: s.name, vendor: s.vendor }));
+    return WEB_FILTER_SIGNATURES.map(s => ({ name: s.name, vendor: s.vendor }));
   }
 }

@@ -1,9 +1,9 @@
 /**
- * origin_ip_detector — Discover the real origin IP behind CDN/proxy/WAF.
+ * origin_ip_detector — Discover the real origin IP behind CDN/proxy/web-filter.
  *
  * When a target sits behind Cloudflare, Akamai, Fastly, etc., the DNS A
  * record points to the CDN edge, not the origin. Finding the origin IP
- * lets an operator bypass the WAF entirely by sending requests directly.
+ * lets an operator bypass the web filter entirely by sending requests directly.
  *
  * Techniques:
  *   1. DNS history — check for historical A/AAAA records that predate CDN
@@ -50,7 +50,7 @@ export interface OriginIpReport {
 }
 
 // CDN IP ranges (partial — enough for fingerprinting, not exhaustive)
-const CDN_RANGES: Record<string, RegExp[]> = {
+const WEB_FILTER_RANGES: Record<string, RegExp[]> = {
   Cloudflare: [
     /^103\.21\.244\./,  /^103\.22\.200\./, /^103\.31\.4\./, /^104\.16\./, /^104\.17\./,
     /^104\.18\./, /^104\.19\./, /^104\.20\./, /^104\.21\./, /^104\.22\./, /^104\.23\./,
@@ -65,7 +65,7 @@ const CDN_RANGES: Record<string, RegExp[]> = {
 
 function identifyCdn(ips: string[]): string | null {
   for (const ip of ips) {
-    for (const [cdn, ranges] of Object.entries(CDN_RANGES)) {
+    for (const [cdn, ranges] of Object.entries(WEB_FILTER_RANGES)) {
       if (ranges.some(r => r.test(ip))) return cdn;
     }
   }
@@ -73,13 +73,13 @@ function identifyCdn(ips: string[]): string | null {
 }
 
 function isCdnIp(ip: string): boolean {
-  for (const ranges of Object.values(CDN_RANGES)) {
+  for (const ranges of Object.values(WEB_FILTER_RANGES)) {
     if (ranges.some(r => r.test(ip))) return true;
   }
   return false;
 }
 
-// Common subdomains that often bypass CDN
+// Common subdomains that often bypass web filter
 const ORIGIN_SUBDOMAINS = [
   'mail', 'smtp', 'pop', 'pop3', 'imap', 'webmail', 'mx', 'mx1', 'mx2',
   'ftp', 'sftp', 'cpanel', 'whm', 'webdisk', 'cpcalendars', 'cpcontacts',

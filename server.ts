@@ -683,7 +683,7 @@ async function startServer() {
 
   app.post('/api/auth-flows/:id/run', async (req, res) => {
     try {
-      const result = await AuthFlowVault.run(req.params.id, {
+      const result = await AuthFlowVault.execute(req.params.id, {
         sessionLabel: typeof req.body?.sessionLabel === 'string' ? req.body.sessionLabel : undefined,
       });
       res.json(result);
@@ -1356,7 +1356,7 @@ async function startServer() {
           pushUnique({
             category: 'spoofing',
             title: `Auth flow "${af.name}" failing (${af.fail_count}x) on ${af.scope_domain}`,
-            description: `Auth flow has ${af.fail_count} failure(s) vs ${af.success_count} success(es). May indicate form changes, anti-automation, or exploitable auth weaknesses.`,
+            description: `Auth flow has ${af.fail_count} failure(s) vs ${af.success_count} success(es). May indicate form changes, anti-automation, or usable auth weaknesses.`,
             affectedAsset: af.scope_domain, attackVector: 'Auth bypass via malformed/replayed auth flows', severity: 'medium', cvss: 5.3,
           });
         }
@@ -1406,7 +1406,7 @@ async function startServer() {
             pushUnique({
               category: 'tampering', title: `Missing CSP on ${host}`,
               description: `No Content-Security-Policy header on ${host}. Without CSP, XSS payloads execute freely — no script-src restriction.`,
-              affectedAsset: host, attackVector: 'XSS exploitation without CSP defense', severity: 'high', cvss: 7.2,
+              affectedAsset: host, attackVector: 'XSS utilization without CSP defense', severity: 'high', cvss: 7.2,
             });
           }
         } catch { /* ignore */ }
@@ -1494,11 +1494,11 @@ async function startServer() {
             affectedAsset: h.url, attackVector: 'Cross-origin data theft via permissive CORS', severity: 'high', cvss: 7.5,
           });
         } else if (cors && creds?.toLowerCase() === 'true') {
-          // Reflected origin with credentials is the actually exploitable case
+          // Reflected origin with credentials is the actually usable case
           pushUnique({
             category: 'info_disclosure', title: `CORS reflects origin with credentials on ${h.url}`,
-            description: `ACAO reflects caller origin with ACAC: true. An attacker's site can make authenticated cross-origin requests and read responses — effectively stealing user data.`,
-            affectedAsset: h.url, attackVector: 'Authenticated cross-origin data theft (reflected origin + credentials)', severity: 'critical', cvss: 9.1,
+            description: `ACAO reflects caller origin with ACAC: true. An unauthorized site can make authenticated cross-origin requests and read responses — effectively accessing user data.`,
+            affectedAsset: h.url, attackVector: 'Authenticated cross-origin data access (reflected origin + credentials)', severity: 'critical', cvss: 9.1,
           });
         }
       }
@@ -2306,7 +2306,7 @@ async function startServer() {
         } catch {
           return res.status(400).json({ error: 'Invalid targetUrl' });
         }
-        const result = await AuthFlowVault.run(resolvedAuthFlowId);
+        const result = await AuthFlowVault.execute(resolvedAuthFlowId);
         if (!result.ok || !result.sessionId) {
           return res
             .status(502)

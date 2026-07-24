@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 
 const dataDir = process.env.LEVARG_DATA_DIR || process.cwd();
-const db = new Database(path.join(dataDir, 'pocforge.db'));
+const db = new Database(path.join(dataDir, 'levarg.db'));
 
 // Initialize schema
 db.exec(`
@@ -222,7 +222,7 @@ db.exec(`
     title TEXT NOT NULL,
     description TEXT,
     affected_asset TEXT,             -- URL, endpoint, or component name
-    attack_vector TEXT,              -- how the threat can be exploited
+    attack_vector TEXT,              -- how the threat can be utilized
     severity TEXT NOT NULL DEFAULT 'medium', -- 'critical' | 'high' | 'medium' | 'low' | 'info'
     status TEXT NOT NULL DEFAULT 'identified', -- 'identified' | 'investigating' | 'mitigated' | 'accepted' | 'resolved'
     mitigation TEXT,                 -- notes on mitigation/remediation

@@ -380,7 +380,7 @@ export class AuthFlowVault {
    * inspect what went wrong (e.g. a captcha challenge that requires manual
    * intervention).
    */
-  static async run(
+  static async execute(
     flowId: string,
     opts: { sessionLabel?: string } = {},
   ): Promise<AuthFlowRunResult> {
