@@ -116,8 +116,8 @@ export class PayloadOven {
     ];
 
     if (layer === 1) return base;
-    if (layer === 2) return [...base, "<script>alert(1)</script>", "' OR '1'='1", '../../../etc/passwd"];
-    return [...base, "<script>alert(1)</script>", "' OR '1'='1", '../../../etc/passwd', '${7*7}', 'SELECT * FROM users'];
+    if (layer === 2) return [...base, "<script>alert(1)</script>", "\" OR '1'='1\"", '../../../etc/passwd'];
+    return [...base, "<script>alert(1)</script>", "\" OR '1'='1\"", '../../../etc/passwd', '${7*7}', 'SELECT * FROM users'];
   }
 
   private static getSessionManagementPayloads(layer: number): string[] {
